@@ -242,15 +242,15 @@ func serialReaderLoop(out chan<- string, in <-chan string) {
 			log.Debugf("RX: %s", text)
 			if strings.HasPrefix(text, string(MaxMsgStart)) {
 				out <- text
-			} else if strings.HasPrefix(text, "21") {
-				// Credit Report: "21  900"
-				parts := strings.Fields(text)
-				if len(parts) >= 2 {
-					if credits, err := strconv.Atoi(parts[1]); err == nil {
-						if dutyMgr != nil {
-							dutyMgr.UpdateCredits(credits)
-						}
-					}
+			} else if dutyMgr != nil && creditResponseRegex.MatchString(text) {
+				// Credit Report: "yy xxx" (e.g., "00 900")
+				// yy = queue length (00 = empty, ready to TX)
+				// xxx = credits (900 = max)
+				var queueLen, credits int
+				_, err := sscanf(text, &queueLen, &credits)
+				if err == nil {
+					dutyMgr.UpdateCredits(credits, queueLen)
+					dutyMgr.SignalCreditResponse()
 				}
 			}
 		}

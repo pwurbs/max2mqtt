@@ -21,7 +21,9 @@ Designed to replace legacy FHEM installations with a lightweight, standalone ser
     -   **Pairing Mode**: Trigger via MQTT (`max/bridge/pair`) to pair new devices.
 -   **Duty Cycle Management**: 
     -   Adheres to 868MHz 1% transmission limits using CUL's credit system.
-    -   Queues and times out commands when credits are low to prevent "LOVF" (Limit Overflow).
+    -   Before each TX: queries CUL credits and queue status (`X` command).
+    -   Only transmits if queue is empty (0) and credits >= minimum threshold.
+    -   Restores MQTT state and logs event if TX is blocked due to duty cycle limits.
 -   **Lightweight**: Static binary built with Go, running in a minimal Alpine container.
 
 ## Protocol Details
@@ -157,5 +159,5 @@ CGO_ENABLED=0 GOOS=linux GOARCH=arm GOARM=7 go build -ldflags="-w -s" -o max2mqt
   - **Temperature**: Sends Type `0x40` (Manual Mode + Target Temp).
   - **Mode**: Supports Auto, Heat (Manual), Off (Manual 4.5°C), and Boost.
   - **Smart Filtering**: Preserves responsiveness by accepting valid ACKs for command confirmation.
-- **Duty Cycle**: Logic implemented to respect 1% bandwidth rule (via 'X' command check).
+- **Duty Cycle**: Pre-TX credit and queue check via 'X' command. TX blocked if queue busy or credits insufficient.
 
