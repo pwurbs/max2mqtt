@@ -156,7 +156,7 @@ CGO_ENABLED=0 GOOS=linux GOARCH=arm GOARM=7 go build -ldflags="-w -s" -o max2mqt
 
 - **Reading/Parsing**: Stable. Validated against real-world data for both Radiator and Wall Thermostats.
 - **Writing (Control)**: Implemented. 
-  - **Temperature**: Sends Type `0x40` (Manual Mode + Target Temp).
+  - **Temperature**: Sends Type `0x40` with Target Temp while preserving the current mode (Auto/Manual/Boost).
   - **Mode**: Supports Auto, Heat (Manual), Off (Manual 4.5°C), and Boost.
   - **Smart Filtering**: Preserves responsiveness by accepting valid ACKs for command confirmation.
 - **Duty Cycle**: Pre-TX credit and queue check via 'X' command. TX blocked if queue busy or credits insufficient.

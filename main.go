@@ -651,17 +651,29 @@ func handleMQTTCommand(client mqtt.Client, msg mqtt.Message) {
 
 	log.Infof("Processing set temperature command: %.1f for %s", temp, srcAddr)
 
-	// Mode: Manual (0x01)
-	// Payload: (Temp * 2) | (Mode << 6)
-	// Temp limit: 0-63.5 (Bits 0-5 unused? No, 7 bits for temp in payload usually?
-	// Protocol says: (Method 0x40) Formula: (TargetTemp * 2) + (ModeBits << 6).
-	// Temp 30.0 * 2 = 60 (0x3C). Fits in lower 6 bits.
-	// 21.5 * 2 = 43 (0x2B).
-	// Mode Manual = 01 (binary). Shifted 6 = 01000000 (0x40).
-	// Total Byte = 0x40 | 0x2B = 0x6B.
+	// Preserve current mode from state cache (default to Manual if unknown)
+	// Mode bits: 00=Auto, 01=Manual, 10=Vacation, 11=Boost
+	var modeBits byte = 0x01 // Default to Manual
 
+	stateMutex.RLock()
+	if existing, ok := stateCache[srcAddr]; ok {
+		switch existing.Mode {
+		case "auto":
+			modeBits = 0x00
+		case "manual":
+			modeBits = 0x01
+		case "vacation":
+			modeBits = 0x02
+		case "boost":
+			modeBits = 0x03
+		}
+		log.Debugf("Preserving current mode '%s' (0x%02X) for %s", existing.Mode, modeBits, srcAddr)
+	}
+	stateMutex.RUnlock()
+
+	// Payload: (Temp * 2) | (Mode << 6)
+	// Protocol says: (Method 0x40) Formula: (TargetTemp * 2) + (ModeBits << 6).
 	tempVal := byte(temp * 2)
-	modeBits := byte(0x01) // Manual
 	payloadByte := tempVal | (modeBits << 6)
 
 	sendCommand(srcAddr, 0x40, []byte{payloadByte})
