@@ -97,7 +97,7 @@ func loadConfig() {
 		LogLevel:            "info",
 		GatewayID:           "123456",
 		DutyCycleMinCredits: 100,
-		CommandTimeout:      "5m",
+		CommandTimeout:      "1m",
 	}
 
 	// Try loading from options.json (Standard HA Add-on location)

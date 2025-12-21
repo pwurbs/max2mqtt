@@ -35,8 +35,8 @@ func initDutyCycleManager() {
 	// Parse Timeout
 	timeout, err := time.ParseDuration(config.CommandTimeout)
 	if err != nil {
-		log.Warnf("Invalid CommandTimeout '%s', defaulting to 5m", config.CommandTimeout)
-		timeout = 5 * time.Minute
+		log.Warnf("Invalid CommandTimeout '%s', defaulting to 1m", config.CommandTimeout)
+		timeout = 1 * time.Minute
 	}
 
 	minCredits := config.DutyCycleMinCredits
