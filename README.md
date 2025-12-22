@@ -55,9 +55,10 @@ This bridge implements a strict filter to ensure high-quality data and avoid sta
 -   **Wall Thermostat State (`0x70`)**:
     -   **Description**: The primary status message from Wall Mounted Thermostats.
     -   **Why**: Contains the authoritative Mode, Valid Setpoint, and Battery status for the room.
--   **Wall Thermostat Control (`0x42`)**:
-    -   **Description**: Sent when adjustments are made directly on the device (e.g., turning the wheel).
-    -   **Why**: Provides immediate feedback on manual changes.
+-   **Wall Thermostat Control (`0x42` / `0x40`)**:
+    -   **Type 0x42**: Sent when adjustments are made directly on the device (e.g., turning the wheel).
+    -   **Type 0x40**: Set Temperature/Mode packet. When received from a device, it indicates a manual change (button press/wheel turn).
+    -   **Why**: Accepted by the bridge to provide immediate feedback on manual changes in Home Assistant.
 -   **Extended Acknowledgements (`0x02`)**:
     -   **Description**: Acks with a payload length $\ge$ 6 bytes.
     -   **Why**: These are special packets sent by Wall Thermostats that contain the **Actual Temperature** (Current Room Temp). This is the only reliable source for this data in the CUL protocol, so we dynamically detect and parse it.

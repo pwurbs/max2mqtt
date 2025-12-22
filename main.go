@@ -371,7 +371,8 @@ func handleSerialMessage(raw string) {
 	// 2. Ack (0x02):
 	//    - Extended: Length >= 6 (Has actual temp)
 	//    - Standard: Length >= 4 (Has Setpoint/Mode/Valve) - Essential for confirmation
-	isValidType := pkt.Type == 0x70 || pkt.Type == 0x60 || pkt.Type == 0x42
+	// 3. SetTemperature (0x40): Manual change on Wall Thermostat
+	isValidType := pkt.Type == 0x70 || pkt.Type == 0x60 || pkt.Type == 0x42 || pkt.Type == 0x40
 	isValidAck := pkt.Type == 0x02 && len(pkt.Payload) >= 4
 
 	if !isValidType && !isValidAck {
@@ -471,7 +472,8 @@ func decodePayload(pkt *MaxPacket) *MaxDeviceData {
 	// Protocol:
 	// Type 0x02, 0x70, 0x60: Thermostat Status (Mode, Valve, Setpoint, Optional Actual)
 	// Type 0x42: WallThermostatControl (Setpoint, Actual Temp)
-	if pkt.Type != 0x02 && pkt.Type != 0x70 && pkt.Type != 0x60 && pkt.Type != 0x42 {
+	// Type 0x40: SetTemperature (Mode, Setpoint)
+	if pkt.Type != 0x02 && pkt.Type != 0x70 && pkt.Type != 0x60 && pkt.Type != 0x42 && pkt.Type != 0x40 {
 		return nil
 	}
 
@@ -495,6 +497,47 @@ func decodePayload(pkt *MaxPacket) *MaxDeviceData {
 		// For 0x42, it seems simpler: just Byte 1.
 		actual := float64(payload[1]) / 10.0
 		data.CurrentTemperature = &actual
+
+		return data
+	}
+
+	// Handle 0x40 (SetTemperature)
+	// Payload: [TargetTemp/Mode]
+	if pkt.Type == 0x40 {
+		if len(payload) < 1 {
+			return nil
+		}
+		// Byte 0:
+		// Bits 0-5: Temp / 2
+		// Bits 6-7: Mode
+		byte0 := payload[0]
+
+		// Mode
+		modeBits := (byte0 >> 6) & 0x03
+		switch modeBits {
+		case 0:
+			data.Mode = "auto"
+			data.HVACMode = "auto"
+		case 1:
+			data.Mode = "manual"
+			data.HVACMode = "heat"
+		case 2:
+			data.Mode = "vacation"
+			data.HVACMode = "off"
+		case 3:
+			data.Mode = "boost"
+			data.HVACMode = "heat"
+		}
+
+		// Temperature
+		// Formula: (Byte & 0x3F) / 2
+		tempRaw := byte0 & 0x3F
+		data.Temperature = float64(tempRaw) / 2.0
+
+		// Special case: Off (4.5C)
+		if data.Mode == "manual" && data.Temperature <= 4.5 {
+			data.HVACMode = "off"
+		}
 
 		return data
 	}
