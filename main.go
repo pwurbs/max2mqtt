@@ -349,7 +349,10 @@ func handleSerialMessage(raw string) {
 
 	// Notify ACK received for TX handshaking (Type 0x02 = ACK)
 	// Do this immediately to unblock pending TX, regardless of payload length/validity for state.
-	if pkt.Type == 0x02 && txMgr != nil {
+	// We also accept 0x70 (Wall), 0x60 (Rad), and 0x42 (WallCtrl) as implicit ACKs,
+	// as receiving them confirms the device is responsive.
+	isAck := pkt.Type == 0x02 || pkt.Type == 0x70 || pkt.Type == 0x60 || pkt.Type == 0x42
+	if isAck && txMgr != nil {
 		txMgr.NotifyAck(pkt.SrcAddr)
 	}
 
