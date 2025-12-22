@@ -41,7 +41,8 @@ var (
 	pairingUntil time.Time
 
 	// Message Counter
-	msgCounter int
+	msgCounter      int
+	msgCounterMutex sync.Mutex
 
 	// Device State Cache (safe for concurrent access)
 	stateCache = make(map[string]*MaxDeviceData)
@@ -761,10 +762,13 @@ func handleMQTTModeCommand(client mqtt.Client, msg mqtt.Message) {
 // sendCommand constructs and sends a MAX! message via CUL
 func sendCommand(dstAddr string, typeByte byte, payload []byte, description string) {
 	// Increment Global Counter
+	msgCounterMutex.Lock()
 	msgCounter++
 	if msgCounter > 255 {
 		msgCounter = 1
 	}
+	cnt := msgCounter
+	msgCounterMutex.Unlock()
 
 	// Src Address (Cube ID)
 	srcBytes, _ := hex.DecodeString(config.GatewayID)
@@ -787,7 +791,7 @@ func sendCommand(dstAddr string, typeByte byte, payload []byte, description stri
 
 	packet := make([]byte, 0, packetLen+1)
 	packet = append(packet, byte(packetLen))
-	packet = append(packet, byte(msgCounter))
+	packet = append(packet, byte(cnt))
 	packet = append(packet, 0x00) // Flag (Standard)
 	packet = append(packet, typeByte)
 	packet = append(packet, srcBytes...)
@@ -820,8 +824,14 @@ func sendPairPong(targetAddr string) {
 	// Structure: Len(1) | Cnt(1) | Type(1) | Src(3) | Dst(3) | Payload(1=0x00?)
 	// To send via CUL: "Zs" + HexString
 
-	// We need a rolling counter, but for now we'll use a fixed one or random.
-	cnt := 0x01
+	// Increment Global Counter safely
+	msgCounterMutex.Lock()
+	msgCounter++
+	if msgCounter > 255 {
+		msgCounter = 1
+	}
+	cnt := msgCounter
+	msgCounterMutex.Unlock()
 
 	srcBytes, _ := hex.DecodeString(config.GatewayID)
 	if len(srcBytes) != 3 {
@@ -830,11 +840,14 @@ func sendPairPong(targetAddr string) {
 
 	dstBytes, _ := hex.DecodeString(targetAddr)
 
-	payload := []byte{0x00} // Standard Pong payload
+	// Payload must be 5 bytes to hit Len 0x0E
+	// Byte 0: Group (0x00)
+	// Byte 1-4: Unknown/Padding? (0x00)
+	payload := []byte{0x00, 0x00, 0x00, 0x00, 0x00}
 
 	// Structure: Len | Cnt | Flg | Type | Src | Dst | Payload
-	// Fields after Len: Cnt(1) + Flg(1) + Type(1) + Src(3) + Dst(3) + Payload(1) = 10 bytes
-	msgLen := 0x0A
+	// Fields after Len: Cnt(1) + Flg(1) + Type(1) + Src(3) + Dst(3) + Payload(5) = 14 bytes (0x0E)
+	msgLen := 0x0E
 
 	// Pkt: Len, Cnt, Flg(0x00), Type(0x01)
 	packet := []byte{byte(msgLen), byte(cnt), 0x00, 0x01}
@@ -848,7 +861,7 @@ func sendPairPong(targetAddr string) {
 
 	select {
 	case serialWrite <- cmd:
-		log.Infof("Sent PairPong to %s", targetAddr)
+		log.Infof("Sent PairPong to %s (Cnt: %d)", targetAddr, cnt)
 	default:
 		log.Error("Serial write queue full")
 	}
