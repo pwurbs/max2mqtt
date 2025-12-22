@@ -727,16 +727,17 @@ func handleMQTTModeCommand(client mqtt.Client, msg mqtt.Message) {
 
 	// Retrieve current state for temp preservation
 	stateMutex.RLock()
-	if existing, ok := stateCache[srcAddr]; ok {
+	if existing, ok := stateCache[srcAddr]; ok && existing.Temperature > 0 {
 		targetTemp = existing.Temperature
+		log.Debugf("Preserving current temperature %.1f for mode change to %s", targetTemp, mode)
 	}
 	stateMutex.RUnlock()
 
 	switch mode {
 	case "auto":
 		modeBits = 0x00
-		// In Auto, temp is handled by schedule, but packet needs a value.
-		// We send current setpoint or 0.
+		// In Auto, we send the current encoded temp to effectively set a temporary override
+		// matching the current setpoint, preserving the value as requested.
 	case "heat": // Manual
 		modeBits = 0x01
 		// Use current setpoint
