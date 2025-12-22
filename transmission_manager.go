@@ -17,13 +17,6 @@ type QueuedCommand struct {
 	CreatedAt   time.Time
 }
 
-// PendingTXInfo tracks a pending TX operation awaiting acknowledgment
-type PendingTXInfo struct {
-	DeviceID  string
-	Command   string
-	StartTime time.Time
-}
-
 // TransmissionManager handles the complexity of sending commands to MAX! devices.
 // It effectively manages two distinct constraints:
 // 1. Regulatory Duty Cycle (via CUL Credits): Ensuring we don't exceed the 1% airtime limit.
@@ -39,8 +32,8 @@ type TransmissionManager struct {
 	queue          chan QueuedCommand
 	creditResponse chan struct{} // Signal when credit response received
 
-	// Pending TX tracking (for handshaking)
-	pendingTX    map[string]*PendingTXInfo
+	// Pending TX tracking (per device)
+	pendingTX    map[string]bool
 	pendingMutex sync.RWMutex
 
 	// LOVF detection
@@ -76,7 +69,7 @@ func initTransmissionManager() {
 		Timeout:        timeout,
 		queue:          make(chan QueuedCommand, 100),
 		creditResponse: make(chan struct{}, 1),
-		pendingTX:      make(map[string]*PendingTXInfo),
+		pendingTX:      make(map[string]bool),
 		lovfChan:       make(chan struct{}, 1),
 		ackChans:       make(map[string]chan struct{}),
 	}
@@ -127,8 +120,8 @@ func (t *TransmissionManager) Enqueue(devicedID, payload, description string) {
 	}
 }
 
-// dispatcherLoop consumes queued commands one by one and processes them.
-// It implements the full TX flow: Check Queue -> Check Credits -> Send -> Wait for ACK.
+// dispatcherLoop consumes queued commands and dispatches them.
+// ACK waiting is handled in separate goroutines to allow parallel TX to different devices.
 func (t *TransmissionManager) dispatcherLoop() {
 	for cmd := range t.queue {
 		// 1. Check Timeout before even querying
@@ -138,9 +131,9 @@ func (t *TransmissionManager) dispatcherLoop() {
 			continue
 		}
 
-		// 2. Check if device already has pending TX (Option A: Reject)
+		// 2. Check if device already has a pending TX - reject if busy
 		if t.IsPendingTX(cmd.DeviceID) {
-			log.Warnf("TxMgr: Device %s has pending TX. Rejecting new command. Restoring state.", cmd.DeviceID)
+			log.Warnf("TxMgr: Device %s busy (awaiting ACK). Rejecting command '%s'. Restoring state.", cmd.DeviceID, cmd.Description)
 			t.restoreState(cmd.DeviceID)
 			continue
 		}
@@ -198,7 +191,8 @@ func (t *TransmissionManager) dispatcherLoop() {
 		default:
 		}
 
-		// 7. All conditions met - dispatch the command and start handshake
+		// 7. All conditions met - mark device as busy and dispatch
+		t.SetPendingTX(cmd.DeviceID)
 
 		// Create ACK channel BEFORE sending to prevent race condition where ACK arrives
 		// before we start waiting. The channel is buffered (size 1) so it will hold the signal.
@@ -206,47 +200,46 @@ func (t *TransmissionManager) dispatcherLoop() {
 
 		select {
 		case serialWrite <- cmd.Payload:
-			t.SetPendingTX(cmd.DeviceID, cmd.Payload)
-			log.Infof("TxMgr: TX dispatched to %s (Credits: %d, Queue: %d). Waiting for ACK...", cmd.DeviceID, credits, queueLen)
+			log.Infof("TxMgr: TX dispatched to %s: '%s' (Credits: %d, Queue: %d). Waiting for ACK...", cmd.DeviceID, cmd.Description, credits, queueLen)
+			// Spawn goroutine to wait for ACK - dispatcher continues immediately
+			go t.handleAckWait(cmd)
 		default:
 			log.Errorf("TxMgr: Serial write channel full! Dropping command for %s", cmd.DeviceID)
+			t.ClearPendingTX(cmd.DeviceID)
 			continue
 		}
-
-		// 8. Wait for ACK, LOVF, or timeout
-		ackReceived := t.waitForAckOrError(cmd.DeviceID)
-
-		if !ackReceived {
-			log.Warnf("TxMgr: No ACK from %s within timeout for command '%s'. Restoring state.", cmd.DeviceID, cmd.Description)
-			t.restoreState(cmd.DeviceID)
-		} else {
-			log.Infof("TxMgr: ACK received from %s. Command confirmed: %s", cmd.DeviceID, cmd.Description)
-		}
-
-		t.ClearPendingTX(cmd.DeviceID)
 	}
 }
 
-// IsPendingTX checks if a device has a pending TX awaiting acknowledgment
+// handleAckWait waits for ACK in a separate goroutine, allowing the dispatcher to continue.
+func (t *TransmissionManager) handleAckWait(cmd QueuedCommand) {
+	defer t.ClearPendingTX(cmd.DeviceID)
+
+	ackReceived := t.waitForAckOrError(cmd.DeviceID)
+
+	if !ackReceived {
+		log.Warnf("TxMgr: No ACK from %s within timeout for command '%s'. Restoring state.", cmd.DeviceID, cmd.Description)
+		t.restoreState(cmd.DeviceID)
+	} else {
+		log.Infof("TxMgr: ACK received from %s. Command confirmed: %s", cmd.DeviceID, cmd.Description)
+	}
+}
+
+// IsPendingTX checks if a device is currently awaiting ACK
 func (t *TransmissionManager) IsPendingTX(deviceID string) bool {
 	t.pendingMutex.RLock()
 	defer t.pendingMutex.RUnlock()
-	_, exists := t.pendingTX[deviceID]
-	return exists
+	return t.pendingTX[deviceID]
 }
 
-// SetPendingTX marks a device as having a pending TX
-func (t *TransmissionManager) SetPendingTX(deviceID, command string) {
+// SetPendingTX marks a device as awaiting ACK
+func (t *TransmissionManager) SetPendingTX(deviceID string) {
 	t.pendingMutex.Lock()
 	defer t.pendingMutex.Unlock()
-	t.pendingTX[deviceID] = &PendingTXInfo{
-		DeviceID:  deviceID,
-		Command:   command,
-		StartTime: time.Now(),
-	}
+	t.pendingTX[deviceID] = true
 }
 
-// ClearPendingTX removes the pending TX marker for a device
+// ClearPendingTX marks a device as no longer awaiting ACK
 func (t *TransmissionManager) ClearPendingTX(deviceID string) {
 	t.pendingMutex.Lock()
 	defer t.pendingMutex.Unlock()
