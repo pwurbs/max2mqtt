@@ -137,7 +137,17 @@ Use the full path in your config:
 
 To pair a new MAX! device:
 1.  Put the device in pairing mode (usually by holding the boost button).
-2.  Send a message to `max/bridge/pair` (payload ignored).
+2.  Trigger the bridge's pairing mode by sending a message to `max/bridge/pair` (payload ignored).
+
+    **Option A: Via Home Assistant UI (Easiest)**
+    1. Go to **Settings** -> **Devices & Services**.
+    2. Find the **MQTT** integration and click **Configure**.
+    3. Under "Publish a packet":
+       - Topic: `max/bridge/pair`
+       - Payload: `on`
+       - Click **Publish**.
+
+    **Option B: Via Command Line**
     ```bash
     mosquitto_pub -h homeassistant -t max/bridge/pair -m "on"
     ```
