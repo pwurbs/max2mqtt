@@ -242,6 +242,12 @@ func serialReaderLoop(out chan<- string, in <-chan string) {
 			log.Debugf("RX: %s", text)
 			if strings.HasPrefix(text, string(MaxMsgStart)) {
 				out <- text
+			} else if text == "LOVF" {
+				// LOVF = Limit Of Voice Full - CUL TX buffer overflow
+				log.Warn("CUL: LOVF (Limit Of Voice Full) - TX buffer overflow")
+				if dutyMgr != nil {
+					dutyMgr.SignalLOVF()
+				}
 			} else if dutyMgr != nil && creditResponseRegex.MatchString(text) {
 				// Credit Report: "yy xxx" (e.g., "00 900")
 				// yy = queue length (00 = empty, ready to TX)
@@ -343,6 +349,12 @@ func handleSerialMessage(raw string) {
 		return
 	}
 
+	// Notify ACK received for TX handshaking (Type 0x02 = ACK)
+	// Do this immediately to unblock pending TX, regardless of payload length/validity for state.
+	if pkt.Type == 0x02 && dutyMgr != nil {
+		dutyMgr.NotifyAck(pkt.SrcAddr)
+	}
+
 	// Message Type Reference (from FHEM 10_MAX.pm):
 	// 0x00 = PairPing
 	// 0x02 = Ack (contains state data)
@@ -427,7 +439,7 @@ func updateDeviceState(srcAddr string, newData *MaxDeviceData) {
 	}
 	stateMutex.Unlock()
 
-	log.Debugf("Decoded Data for %s: %+v", srcAddr, &dataToPublish)
+	log.Infof("Decoded Data for %s: %s", srcAddr, &dataToPublish)
 	publishState(srcAddr, &dataToPublish)
 }
 
@@ -439,6 +451,16 @@ type MaxDeviceData struct {
 	HVACMode   string `json:"hvac_mode,omitempty"`
 	HVACAction string `json:"hvac_action,omitempty"`
 	Battery    string `json:"battery,omitempty"`
+}
+
+// convert pointer to string for appropriate logging
+func (d *MaxDeviceData) String() string {
+	curTempStr := "N/A"
+	if d.CurrentTemperature != nil {
+		curTempStr = fmt.Sprintf("%.1f", *d.CurrentTemperature)
+	}
+	return fmt.Sprintf("Temp: %.1f, CurTemp: %s, Mode: %s, Action: %s, Batt: %s",
+		d.Temperature, curTempStr, d.Mode, d.HVACAction, d.Battery)
 }
 
 // decodePayload parses the MAX! thermostat state payload
@@ -668,6 +690,8 @@ func handleMQTTCommand(client mqtt.Client, msg mqtt.Message) {
 			modeBits = 0x03
 		}
 		log.Debugf("Preserving current mode '%s' (0x%02X) for %s", existing.Mode, modeBits, srcAddr)
+	} else {
+		log.Warnf("No cached state for %s, defaulting to Manual mode", srcAddr)
 	}
 	stateMutex.RUnlock()
 
@@ -676,7 +700,7 @@ func handleMQTTCommand(client mqtt.Client, msg mqtt.Message) {
 	tempVal := byte(temp * 2)
 	payloadByte := tempVal | (modeBits << 6)
 
-	sendCommand(srcAddr, 0x40, []byte{payloadByte})
+	sendCommand(srcAddr, 0x40, []byte{payloadByte}, fmt.Sprintf("Set Temp %.1f", temp))
 }
 
 func handleMQTTPair(client mqtt.Client, msg mqtt.Message) {
@@ -729,11 +753,11 @@ func handleMQTTModeCommand(client mqtt.Client, msg mqtt.Message) {
 	tempVal := byte(targetTemp * 2)
 	payloadByte := tempVal | (modeBits << 6)
 
-	sendCommand(srcAddr, 0x40, []byte{payloadByte})
+	sendCommand(srcAddr, 0x40, []byte{payloadByte}, fmt.Sprintf("Set Mode %s", mode))
 }
 
 // sendCommand constructs and sends a MAX! message via CUL
-func sendCommand(dstAddr string, typeByte byte, payload []byte) {
+func sendCommand(dstAddr string, typeByte byte, payload []byte, description string) {
 	// Increment Global Counter
 	msgCounter++
 	if msgCounter > 255 {
@@ -777,12 +801,12 @@ func sendCommand(dstAddr string, typeByte byte, payload []byte) {
 	cmd := "Zs" + hexStr
 
 	if dutyMgr != nil {
-		dutyMgr.Enqueue(dstAddr, cmd)
+		dutyMgr.Enqueue(dstAddr, cmd, description)
 	} else {
 		// Fallback if not init (should not happen)
 		select {
 		case serialWrite <- cmd:
-			log.Infof("TX -> %s: Mode/Temp (Type 0x%02X) [%s]", dstAddr, typeByte, hexStr)
+			log.Infof("TX -> %s: %s [%s]", dstAddr, description, hexStr)
 		default:
 			log.Error("Serial write queue full")
 		}
