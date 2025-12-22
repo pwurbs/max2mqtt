@@ -9,6 +9,7 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
+// QueuedCommand represents a TX command waiting in the local queue
 type QueuedCommand struct {
 	Payload     string
 	Description string
@@ -23,7 +24,12 @@ type PendingTXInfo struct {
 	StartTime time.Time
 }
 
-type DutyCycleManager struct {
+// TransmissionManager handles the complexity of sending commands to MAX! devices.
+// It effectively manages two distinct constraints:
+// 1. Regulatory Duty Cycle (via CUL Credits): Ensuring we don't exceed the 1% airtime limit.
+// 2. Reliable Delivery (via Handshaking): Ensuring commands are acknowledged by the device (ACK).
+type TransmissionManager struct {
+	// Duty Cycle State
 	CurrentCredits int
 	QueueLength    int // CUL's internal send queue (0 = empty, ready to TX)
 	MinCredits     int
@@ -45,12 +51,12 @@ type DutyCycleManager struct {
 	ackMutex sync.Mutex
 }
 
-var dutyMgr *DutyCycleManager
+var txMgr *TransmissionManager
 
 // creditResponseRegex matches credit response format: "yy xxx" (e.g., "00 900", "01 850")
 var creditResponseRegex = regexp.MustCompile(`^\d+\s+\d+$`)
 
-func initDutyCycleManager() {
+func initTransmissionManager() {
 	// Parse Timeout
 	timeout, err := time.ParseDuration(config.CommandTimeout)
 	if err != nil {
@@ -63,7 +69,7 @@ func initDutyCycleManager() {
 		minCredits = 100 // Safe default
 	}
 
-	dutyMgr = &DutyCycleManager{
+	txMgr = &TransmissionManager{
 		CurrentCredits: 0, // Start pessimistic - will query before first TX
 		QueueLength:    0,
 		MinCredits:     minCredits,
@@ -75,34 +81,37 @@ func initDutyCycleManager() {
 		ackChans:       make(map[string]chan struct{}),
 	}
 
-	log.Infof("DutyCycleManager initialized. MinCredits: %d, Timeout: %s", minCredits, timeout)
+	log.Infof("TransmissionManager initialized. MinCredits: %d, Timeout: %s", minCredits, timeout)
 
-	go dutyMgr.dispatcherLoop()
+	go txMgr.dispatcherLoop()
 }
 
-func (d *DutyCycleManager) Start() {
+func (t *TransmissionManager) Start() {
 	// Optional: Any explicit start logic
 }
 
 // UpdateCredits updates both credits and queue length from CUL response
-func (d *DutyCycleManager) UpdateCredits(credits, queueLen int) {
-	d.mutex.Lock()
-	d.CurrentCredits = credits
-	d.QueueLength = queueLen
-	d.mutex.Unlock()
-	log.Debugf("DutyCycle: Updated - Credits: %d, Queue: %d", credits, queueLen)
+func (t *TransmissionManager) UpdateCredits(credits, queueLen int) {
+	t.mutex.Lock()
+	t.CurrentCredits = credits
+	t.QueueLength = queueLen
+	t.mutex.Unlock()
+	log.Debugf("TxMgr: Updated - Credits: %d, Queue: %d", credits, queueLen)
 }
 
-// SignalCreditResponse signals that a credit response was received
-func (d *DutyCycleManager) SignalCreditResponse() {
+// SignalCreditResponse notifies the dispatcher that a credit report "yy xxx" has been received.
+// This unblocks the dispatcher if it was waiting for a credit check.
+func (t *TransmissionManager) SignalCreditResponse() {
 	select {
-	case d.creditResponse <- struct{}{}:
+	case t.creditResponse <- struct{}{}:
 	default:
 		// Channel already has a signal, don't block
 	}
 }
 
-func (d *DutyCycleManager) Enqueue(devicedID, payload, description string) {
+// Enqueue adds a command to the transmission queue.
+// It is safe to call from multiple goroutines (e.g., MQTT handlers).
+func (t *TransmissionManager) Enqueue(devicedID, payload, description string) {
 	cmd := QueuedCommand{
 		Payload:     payload,
 		Description: description,
@@ -111,35 +120,37 @@ func (d *DutyCycleManager) Enqueue(devicedID, payload, description string) {
 	}
 
 	select {
-	case d.queue <- cmd:
-		log.Debugf("DutyCycle: Enqueued command for %s: %s", devicedID, description)
+	case t.queue <- cmd:
+		log.Debugf("TxMgr: Enqueued command for %s: %s", devicedID, description)
 	default:
-		log.Warnf("DutyCycle: Queue full! Dropping command for %s", devicedID)
+		log.Warnf("TxMgr: Queue full! Dropping command for %s", devicedID)
 	}
 }
 
-func (d *DutyCycleManager) dispatcherLoop() {
-	for cmd := range d.queue {
+// dispatcherLoop consumes queued commands one by one and processes them.
+// It implements the full TX flow: Check Queue -> Check Credits -> Send -> Wait for ACK.
+func (t *TransmissionManager) dispatcherLoop() {
+	for cmd := range t.queue {
 		// 1. Check Timeout before even querying
-		if time.Since(cmd.CreatedAt) > d.Timeout {
+		if time.Since(cmd.CreatedAt) > t.Timeout {
 			log.Warnf("Command to %s timed out (waited %s) due to duty cycle limits. Restoring state.", cmd.DeviceID, time.Since(cmd.CreatedAt))
-			d.restoreState(cmd.DeviceID)
+			t.restoreState(cmd.DeviceID)
 			continue
 		}
 
 		// 2. Check if device already has pending TX (Option A: Reject)
-		if d.IsPendingTX(cmd.DeviceID) {
-			log.Warnf("DutyCycle: Device %s has pending TX. Rejecting new command. Restoring state.", cmd.DeviceID)
-			d.restoreState(cmd.DeviceID)
+		if t.IsPendingTX(cmd.DeviceID) {
+			log.Warnf("TxMgr: Device %s has pending TX. Rejecting new command. Restoring state.", cmd.DeviceID)
+			t.restoreState(cmd.DeviceID)
 			continue
 		}
 
 		// 3. Query credits before TX
-		log.Debug("DutyCycle: Querying credits before TX (X)")
+		log.Debug("TxMgr: Querying credits before TX (X)")
 
 		// Clear any stale signal
 		select {
-		case <-d.creditResponse:
+		case <-t.creditResponse:
 		default:
 		}
 
@@ -147,43 +158,43 @@ func (d *DutyCycleManager) dispatcherLoop() {
 		select {
 		case serialWrite <- "X":
 		default:
-			log.Warn("DutyCycle: Could not send credit query (channel full)")
-			d.restoreState(cmd.DeviceID)
+			log.Warn("TxMgr: Could not send credit query (channel full)")
+			t.restoreState(cmd.DeviceID)
 			continue
 		}
 
 		// 4. Wait for credit response with timeout
 		queryTimeout := 3 * time.Second
 		select {
-		case <-d.creditResponse:
+		case <-t.creditResponse:
 			// Response received, continue to check
 		case <-time.After(queryTimeout):
-			log.Warnf("DutyCycle: Credit query timeout after %s. Restoring state for %s.", queryTimeout, cmd.DeviceID)
-			d.restoreState(cmd.DeviceID)
+			log.Warnf("TxMgr: Credit query timeout after %s. Restoring state for %s.", queryTimeout, cmd.DeviceID)
+			t.restoreState(cmd.DeviceID)
 			continue
 		}
 
 		// 5. Check conditions: queue == 0 AND credits >= minCredits
-		d.mutex.RLock()
-		credits := d.CurrentCredits
-		queueLen := d.QueueLength
-		d.mutex.RUnlock()
+		t.mutex.RLock()
+		credits := t.CurrentCredits
+		queueLen := t.QueueLength
+		t.mutex.RUnlock()
 
 		if queueLen != 0 {
-			log.Warnf("DutyCycle: CUL queue busy (queue=%d). Cannot TX to %s. Restoring state.", queueLen, cmd.DeviceID)
-			d.restoreState(cmd.DeviceID)
+			log.Warnf("TxMgr: CUL queue busy (queue=%d). Cannot TX to %s. Restoring state.", queueLen, cmd.DeviceID)
+			t.restoreState(cmd.DeviceID)
 			continue
 		}
 
-		if credits < d.MinCredits {
-			log.Warnf("DutyCycle: Insufficient credits (%d < %d). Cannot TX to %s. Restoring state.", credits, d.MinCredits, cmd.DeviceID)
-			d.restoreState(cmd.DeviceID)
+		if credits < t.MinCredits {
+			log.Warnf("TxMgr: Insufficient credits (%d < %d). Cannot TX to %s. Restoring state.", credits, t.MinCredits, cmd.DeviceID)
+			t.restoreState(cmd.DeviceID)
 			continue
 		}
 
 		// 6. Clear LOVF channel before TX
 		select {
-		case <-d.lovfChan:
+		case <-t.lovfChan:
 		default:
 		}
 
@@ -191,44 +202,44 @@ func (d *DutyCycleManager) dispatcherLoop() {
 
 		// Create ACK channel BEFORE sending to prevent race condition where ACK arrives
 		// before we start waiting. The channel is buffered (size 1) so it will hold the signal.
-		d.getOrCreateAckChan(cmd.DeviceID)
+		t.getOrCreateAckChan(cmd.DeviceID)
 
 		select {
 		case serialWrite <- cmd.Payload:
-			d.SetPendingTX(cmd.DeviceID, cmd.Payload)
-			log.Infof("DutyCycle: TX dispatched to %s (Credits: %d, Queue: %d). Waiting for ACK...", cmd.DeviceID, credits, queueLen)
+			t.SetPendingTX(cmd.DeviceID, cmd.Payload)
+			log.Infof("TxMgr: TX dispatched to %s (Credits: %d, Queue: %d). Waiting for ACK...", cmd.DeviceID, credits, queueLen)
 		default:
-			log.Errorf("DutyCycle: Serial write channel full! Dropping command for %s", cmd.DeviceID)
+			log.Errorf("TxMgr: Serial write channel full! Dropping command for %s", cmd.DeviceID)
 			continue
 		}
 
 		// 8. Wait for ACK, LOVF, or timeout
-		ackReceived := d.waitForAckOrError(cmd.DeviceID)
+		ackReceived := t.waitForAckOrError(cmd.DeviceID)
 
 		if !ackReceived {
-			log.Warnf("DutyCycle: No ACK from %s within timeout for command '%s'. Restoring state.", cmd.DeviceID, cmd.Description)
-			d.restoreState(cmd.DeviceID)
+			log.Warnf("TxMgr: No ACK from %s within timeout for command '%s'. Restoring state.", cmd.DeviceID, cmd.Description)
+			t.restoreState(cmd.DeviceID)
 		} else {
-			log.Infof("DutyCycle: ACK received from %s. Command confirmed: %s", cmd.DeviceID, cmd.Description)
+			log.Infof("TxMgr: ACK received from %s. Command confirmed: %s", cmd.DeviceID, cmd.Description)
 		}
 
-		d.ClearPendingTX(cmd.DeviceID)
+		t.ClearPendingTX(cmd.DeviceID)
 	}
 }
 
 // IsPendingTX checks if a device has a pending TX awaiting acknowledgment
-func (d *DutyCycleManager) IsPendingTX(deviceID string) bool {
-	d.pendingMutex.RLock()
-	defer d.pendingMutex.RUnlock()
-	_, exists := d.pendingTX[deviceID]
+func (t *TransmissionManager) IsPendingTX(deviceID string) bool {
+	t.pendingMutex.RLock()
+	defer t.pendingMutex.RUnlock()
+	_, exists := t.pendingTX[deviceID]
 	return exists
 }
 
 // SetPendingTX marks a device as having a pending TX
-func (d *DutyCycleManager) SetPendingTX(deviceID, command string) {
-	d.pendingMutex.Lock()
-	defer d.pendingMutex.Unlock()
-	d.pendingTX[deviceID] = &PendingTXInfo{
+func (t *TransmissionManager) SetPendingTX(deviceID, command string) {
+	t.pendingMutex.Lock()
+	defer t.pendingMutex.Unlock()
+	t.pendingTX[deviceID] = &PendingTXInfo{
 		DeviceID:  deviceID,
 		Command:   command,
 		StartTime: time.Now(),
@@ -236,26 +247,26 @@ func (d *DutyCycleManager) SetPendingTX(deviceID, command string) {
 }
 
 // ClearPendingTX removes the pending TX marker for a device
-func (d *DutyCycleManager) ClearPendingTX(deviceID string) {
-	d.pendingMutex.Lock()
-	defer d.pendingMutex.Unlock()
-	delete(d.pendingTX, deviceID)
+func (t *TransmissionManager) ClearPendingTX(deviceID string) {
+	t.pendingMutex.Lock()
+	defer t.pendingMutex.Unlock()
+	delete(t.pendingTX, deviceID)
 }
 
 // SignalLOVF signals that a LOVF (Limit Of Voice Full) response was received
-func (d *DutyCycleManager) SignalLOVF() {
+func (t *TransmissionManager) SignalLOVF() {
 	select {
-	case d.lovfChan <- struct{}{}:
+	case t.lovfChan <- struct{}{}:
 	default:
 		// Channel already has a signal, don't block
 	}
 }
 
 // NotifyAck notifies that an ACK was received from a specific device
-func (d *DutyCycleManager) NotifyAck(deviceID string) {
-	d.ackMutex.Lock()
-	ch, exists := d.ackChans[deviceID]
-	d.ackMutex.Unlock()
+func (t *TransmissionManager) NotifyAck(deviceID string) {
+	t.ackMutex.Lock()
+	ch, exists := t.ackChans[deviceID]
+	t.ackMutex.Unlock()
 
 	if exists {
 		select {
@@ -266,56 +277,57 @@ func (d *DutyCycleManager) NotifyAck(deviceID string) {
 	}
 }
 
-// waitForAckOrError waits for ACK, LOVF, or timeout
-func (d *DutyCycleManager) waitForAckOrError(deviceID string) bool {
-	ackChan := d.getOrCreateAckChan(deviceID)
-	defer d.removeAckChan(deviceID)
+// waitForAckOrError waits for the specific device to acknowledge the command.
+// It returns true if ACK received, false if timed out or LOVF occurred.
+func (t *TransmissionManager) waitForAckOrError(deviceID string) bool {
+	ackChan := t.getOrCreateAckChan(deviceID)
+	defer t.removeAckChan(deviceID)
 
 	select {
 	case <-ackChan:
 		return true
-	case <-d.lovfChan:
-		log.Warn("DutyCycle: LOVF received during TX wait")
+	case <-t.lovfChan:
+		log.Warn("TxMgr: LOVF received during TX wait")
 		return false
-	case <-time.After(d.Timeout):
+	case <-time.After(t.Timeout):
 		return false
 	}
 }
 
 // getOrCreateAckChan gets or creates an ACK channel for a device
-func (d *DutyCycleManager) getOrCreateAckChan(deviceID string) chan struct{} {
-	d.ackMutex.Lock()
-	defer d.ackMutex.Unlock()
+func (t *TransmissionManager) getOrCreateAckChan(deviceID string) chan struct{} {
+	t.ackMutex.Lock()
+	defer t.ackMutex.Unlock()
 
-	if ch, exists := d.ackChans[deviceID]; exists {
+	if ch, exists := t.ackChans[deviceID]; exists {
 		return ch
 	}
 
 	ch := make(chan struct{}, 1)
-	d.ackChans[deviceID] = ch
+	t.ackChans[deviceID] = ch
 	return ch
 }
 
 // removeAckChan removes the ACK channel for a device
-func (d *DutyCycleManager) removeAckChan(deviceID string) {
-	d.ackMutex.Lock()
-	defer d.ackMutex.Unlock()
-	delete(d.ackChans, deviceID)
+func (t *TransmissionManager) removeAckChan(deviceID string) {
+	t.ackMutex.Lock()
+	defer t.ackMutex.Unlock()
+	delete(t.ackChans, deviceID)
 }
 
-func (d *DutyCycleManager) restoreState(deviceID string) {
+func (t *TransmissionManager) restoreState(deviceID string) {
 	stateMutex.RLock()
 	existing, ok := stateCache[deviceID]
 	stateMutex.RUnlock()
 
 	if !ok {
-		log.Warnf("DutyCycle: No state known for %s to restore.", deviceID)
+		log.Warnf("TxMgr: No state known for %s to restore.", deviceID)
 		return
 	}
 
 	// Re-publish the existing clean state to MQTT
 	// This overwrites any optimistic UI changes in HA
-	log.Infof("DutyCycle: Restoring state for %s: %s", deviceID, existing)
+	log.Infof("TxMgr: Restoring state for %s: %s", deviceID, existing)
 	// We need to modify existing state slightly or just publish?
 	// If we just publish, HA receives the "old" values again and updates UI.
 	publishState(deviceID, existing)

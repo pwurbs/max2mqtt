@@ -62,7 +62,7 @@ func main() {
 	log.Info("Starting MAX! to MQTT Bridge")
 
 	// 1.5. Duty Cycle
-	initDutyCycleManager()
+	initTransmissionManager()
 
 	// 2. Setup MQTT
 	setupMQTT()
@@ -245,18 +245,16 @@ func serialReaderLoop(out chan<- string, in <-chan string) {
 			} else if text == "LOVF" {
 				// LOVF = Limit Of Voice Full - CUL TX buffer overflow
 				log.Warn("CUL: LOVF (Limit Of Voice Full) - TX buffer overflow")
-				if dutyMgr != nil {
-					dutyMgr.SignalLOVF()
+				if txMgr != nil {
+					txMgr.SignalLOVF()
 				}
-			} else if dutyMgr != nil && creditResponseRegex.MatchString(text) {
-				// Credit Report: "yy xxx" (e.g., "00 900")
-				// yy = queue length (00 = empty, ready to TX)
-				// xxx = credits (900 = max)
-				var queueLen, credits int
-				_, err := sscanf(text, &queueLen, &credits)
-				if err == nil {
-					dutyMgr.UpdateCredits(credits, queueLen)
-					dutyMgr.SignalCreditResponse()
+			} else if txMgr != nil {
+				// Check for Credit Report: "yy xxx" (e.g., "00 900")
+				// Delegated to TransmissionManager's parser
+				queueLen, credits, matched := ParseCreditResponse(text)
+				if matched {
+					txMgr.UpdateCredits(credits, queueLen)
+					txMgr.SignalCreditResponse()
 				}
 			}
 		}
@@ -351,8 +349,8 @@ func handleSerialMessage(raw string) {
 
 	// Notify ACK received for TX handshaking (Type 0x02 = ACK)
 	// Do this immediately to unblock pending TX, regardless of payload length/validity for state.
-	if pkt.Type == 0x02 && dutyMgr != nil {
-		dutyMgr.NotifyAck(pkt.SrcAddr)
+	if pkt.Type == 0x02 && txMgr != nil {
+		txMgr.NotifyAck(pkt.SrcAddr)
 	}
 
 	// Message Type Reference (from FHEM 10_MAX.pm):
@@ -800,8 +798,8 @@ func sendCommand(dstAddr string, typeByte byte, payload []byte, description stri
 	// CUL expects: Zs<HexData>
 	cmd := "Zs" + hexStr
 
-	if dutyMgr != nil {
-		dutyMgr.Enqueue(dstAddr, cmd, description)
+	if txMgr != nil {
+		txMgr.Enqueue(dstAddr, cmd, description)
 	} else {
 		// Fallback if not init (should not happen)
 		select {
