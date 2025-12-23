@@ -47,7 +47,52 @@ var (
 	// Device State Cache (safe for concurrent access)
 	stateCache = make(map[string]*MaxDeviceData)
 	stateMutex sync.RWMutex
+
+	// Device Config Cache - stores configuration values for each device
+	// Used to preserve other config values when changing eco/comfort temperatures
+	deviceConfigCache = make(map[string]*DeviceConfig)
+	configMutex       sync.RWMutex
 )
+
+// DeviceConfig stores the full device configuration for ConfigTemperatures (Type 0x11)
+// When changing eco/comfort temperatures, we preserve other values from the cached config.
+type DeviceConfig struct {
+	ComfortTemp        float64 // Comfort temperature (default 21.0)
+	EcoTemp            float64 // Eco temperature (default 17.0)
+	MaxTemp            float64 // Maximum temperature (default 30.5)
+	MinTemp            float64 // Minimum temperature (default 4.5)
+	MeasurementOffset  float64 // Temperature offset (-3.5 to +3.5, default 0)
+	WindowOpenTemp     float64 // Window open temperature (default 12.0)
+	WindowOpenDuration int     // Window open duration in minutes (default 15)
+}
+
+// getDeviceConfig returns the cached config for a device, or creates a new one with defaults
+func getDeviceConfig(deviceAddr string) *DeviceConfig {
+	configMutex.RLock()
+	cfg, exists := deviceConfigCache[deviceAddr]
+	configMutex.RUnlock()
+
+	if exists {
+		return cfg
+	}
+
+	// Create default config
+	cfg = &DeviceConfig{
+		ComfortTemp:        21.0,
+		EcoTemp:            17.0,
+		MaxTemp:            30.5,
+		MinTemp:            4.5,
+		MeasurementOffset:  0.0,
+		WindowOpenTemp:     12.0,
+		WindowOpenDuration: 15,
+	}
+
+	configMutex.Lock()
+	deviceConfigCache[deviceAddr] = cfg
+	configMutex.Unlock()
+
+	return cfg
+}
 
 // Constants for MAX! Protocol
 const (
@@ -171,6 +216,10 @@ func setupMQTT() {
 		c.Subscribe("max/+/set", 0, handleMQTTCommand)
 		c.Subscribe("max/+/mode/set", 0, handleMQTTModeCommand)
 		c.Subscribe("max/bridge/pair", 0, handleMQTTPair)
+		// Subscribe to config commands (eco temp, comfort temp, display mode)
+		c.Subscribe("max/+/eco_temp/set", 0, handleMQTTEcoTemp)
+		c.Subscribe("max/+/comfort_temp/set", 0, handleMQTTComfortTemp)
+		c.Subscribe("max/+/display_mode/set", 0, handleMQTTDisplayMode)
 	})
 
 	mqttClient = mqtt.NewClient(opts)
@@ -352,7 +401,8 @@ func handleSerialMessage(raw string) {
 	// Do this immediately to unblock pending TX, regardless of payload length/validity for state.
 	// We also accept 0x70 (Wall), 0x60 (Rad), and 0x42 (WallCtrl) as implicit ACKs,
 	// as receiving them confirms the device is responsive.
-	isAck := pkt.Type == 0x02 || pkt.Type == 0x70 || pkt.Type == 0x60 || pkt.Type == 0x42
+	// We also accept 0x40 (SetTemperature) as implicit ACK - device broadcasts state after config changes
+	isAck := pkt.Type == 0x02 || pkt.Type == 0x70 || pkt.Type == 0x60 || pkt.Type == 0x42 || pkt.Type == 0x40
 	if isAck && txMgr != nil {
 		txMgr.NotifyAck(pkt.SrcAddr)
 	}
@@ -670,6 +720,63 @@ func sendDiscovery(srcAddr string) {
 	bytes, _ = json.Marshal(battPayload)
 	token := mqttClient.Publish(battTopic, 0, true, bytes)
 	token.Wait()
+
+	// 4. Eco Temperature Number Entity
+	// Allows configuration of eco temperature from Home Assistant
+	// mode: "box" displays as text input instead of slider
+	ecoTempTopic := fmt.Sprintf("homeassistant/number/%s_eco_temp/config", deviceID)
+	ecoTempPayload := map[string]interface{}{
+		"name":                "Eco Temperature",
+		"unique_id":           deviceID + "_eco_temp",
+		"icon":                "mdi:leaf",
+		"entity_category":     "config",
+		"mode":                "box",
+		"min":                 4.5,
+		"max":                 30.5,
+		"step":                0.5,
+		"unit_of_measurement": "°C",
+		"command_topic":       fmt.Sprintf("max/%s/eco_temp/set", srcAddr),
+		"device":              deviceInfo,
+	}
+	bytes, _ = json.Marshal(ecoTempPayload)
+	mqttClient.Publish(ecoTempTopic, 0, true, bytes)
+
+	// 5. Comfort Temperature Number Entity
+	// Allows configuration of comfort temperature from Home Assistant
+	// mode: "box" displays as text input instead of slider
+	comfortTempTopic := fmt.Sprintf("homeassistant/number/%s_comfort_temp/config", deviceID)
+	comfortTempPayload := map[string]interface{}{
+		"name":                "Comfort Temperature",
+		"unique_id":           deviceID + "_comfort_temp",
+		"icon":                "mdi:sofa",
+		"entity_category":     "config",
+		"mode":                "box",
+		"min":                 4.5,
+		"max":                 30.5,
+		"step":                0.5,
+		"unit_of_measurement": "°C",
+		"command_topic":       fmt.Sprintf("max/%s/comfort_temp/set", srcAddr),
+		"device":              deviceInfo,
+	}
+	bytes, _ = json.Marshal(comfortTempPayload)
+	mqttClient.Publish(comfortTempTopic, 0, true, bytes)
+
+	// 6. Display Mode Select Entity (Wall Thermostats only, but shown for all devices)
+	// Options: "Setpoint" (show target temp) or "Actual" (show current temp)
+	// Note: This setting only affects Wall Thermostats; Radiator Thermostats will ignore it.
+	displayModeTopic := fmt.Sprintf("homeassistant/select/%s_display_mode/config", deviceID)
+	displayModePayload := map[string]interface{}{
+		"name":            "Display Mode",
+		"unique_id":       deviceID + "_display_mode",
+		"icon":            "mdi:thermometer-lines",
+		"entity_category": "config",
+		"command_topic":   fmt.Sprintf("max/%s/display_mode/set", srcAddr),
+		"options":         []string{"Setpoint", "Actual"},
+		"optimistic":      true,
+		"device":          deviceInfo,
+	}
+	bytes, _ = json.Marshal(displayModePayload)
+	mqttClient.Publish(displayModeTopic, 0, true, bytes)
 }
 
 func publishState(srcAddr string, data *MaxDeviceData) {
@@ -908,4 +1015,132 @@ func sendPairPong(targetAddr string) {
 	default:
 		log.Error("Serial write queue full")
 	}
+}
+
+// handleMQTTEcoTemp handles eco temperature configuration
+// Topic: max/<id>/eco_temp/set
+// Payload: Temperature float (e.g. "17.0")
+func handleMQTTEcoTemp(client mqtt.Client, msg mqtt.Message) {
+	topicParts := strings.Split(msg.Topic(), "/")
+	if len(topicParts) < 4 {
+		return
+	}
+	srcAddr := topicParts[1]
+	payloadStr := string(msg.Payload())
+
+	temp, err := strconv.ParseFloat(payloadStr, 64)
+	if err != nil {
+		log.Errorf("Invalid eco temperature format: %s", payloadStr)
+		return
+	}
+
+	// Validate range (4.5 - 30.5)
+	if temp < 4.5 || temp > 30.5 {
+		log.Errorf("Eco temperature out of range (4.5-30.5): %.1f", temp)
+		return
+	}
+
+	log.Infof("Setting eco temperature for %s: %.1f", srcAddr, temp)
+
+	// Update cached config
+	cfg := getDeviceConfig(srcAddr)
+	configMutex.Lock()
+	cfg.EcoTemp = temp
+	configMutex.Unlock()
+
+	// Send ConfigTemperatures command
+	sendConfigTemperatures(srcAddr, cfg)
+}
+
+// handleMQTTComfortTemp handles comfort temperature configuration
+// Topic: max/<id>/comfort_temp/set
+// Payload: Temperature float (e.g. "21.0")
+func handleMQTTComfortTemp(client mqtt.Client, msg mqtt.Message) {
+	topicParts := strings.Split(msg.Topic(), "/")
+	if len(topicParts) < 4 {
+		return
+	}
+	srcAddr := topicParts[1]
+	payloadStr := string(msg.Payload())
+
+	temp, err := strconv.ParseFloat(payloadStr, 64)
+	if err != nil {
+		log.Errorf("Invalid comfort temperature format: %s", payloadStr)
+		return
+	}
+
+	// Validate range (4.5 - 30.5)
+	if temp < 4.5 || temp > 30.5 {
+		log.Errorf("Comfort temperature out of range (4.5-30.5): %.1f", temp)
+		return
+	}
+
+	log.Infof("Setting comfort temperature for %s: %.1f", srcAddr, temp)
+
+	// Update cached config
+	cfg := getDeviceConfig(srcAddr)
+	configMutex.Lock()
+	cfg.ComfortTemp = temp
+	configMutex.Unlock()
+
+	// Send ConfigTemperatures command
+	sendConfigTemperatures(srcAddr, cfg)
+}
+
+// handleMQTTDisplayMode handles display mode for wall thermostats
+// Topic: max/<id>/display_mode/set
+// Payload: "Setpoint" (show target temp) or "Actual" (show current temp)
+// Note: This only affects Wall Thermostats; Radiator Thermostats will ignore this command.
+func handleMQTTDisplayMode(client mqtt.Client, msg mqtt.Message) {
+	topicParts := strings.Split(msg.Topic(), "/")
+	if len(topicParts) < 4 {
+		return
+	}
+	srcAddr := topicParts[1]
+	payload := string(msg.Payload())
+
+	showActual := strings.EqualFold(payload, "Actual")
+	log.Infof("Setting display mode for %s: %s (showActual=%v)", srcAddr, payload, showActual)
+
+	sendDisplayMode(srcAddr, showActual)
+}
+
+// sendConfigTemperatures sends Type 0x11 ConfigTemperatures command
+// Uses cached config values for all parameters
+// Payload structure (7 bytes):
+//   - Byte 0: Comfort temperature (*2)
+//   - Byte 1: Eco temperature (*2)
+//   - Byte 2: Max temperature (*2)
+//   - Byte 3: Min temperature (*2)
+//   - Byte 4: Measurement offset ((value + 3.5) * 2)
+//   - Byte 5: Window open temperature (*2)
+//   - Byte 6: Window open duration (/5 minutes)
+func sendConfigTemperatures(dstAddr string, cfg *DeviceConfig) {
+	payload := make([]byte, 7)
+	payload[0] = byte(cfg.ComfortTemp * 2)
+	payload[1] = byte(cfg.EcoTemp * 2)
+	payload[2] = byte(cfg.MaxTemp * 2)
+	payload[3] = byte(cfg.MinTemp * 2)
+	payload[4] = byte((cfg.MeasurementOffset + 3.5) * 2)
+	payload[5] = byte(cfg.WindowOpenTemp * 2)
+	payload[6] = byte(cfg.WindowOpenDuration / 5)
+
+	description := fmt.Sprintf("Config Temps (Comfort: %.1f, Eco: %.1f)", cfg.ComfortTemp, cfg.EcoTemp)
+	sendCommand(dstAddr, 0x11, payload, description)
+}
+
+// sendDisplayMode sends Type 0x82 SetDisplayActualTemperature command
+// Payload: 0x04 (show actual temperature) or 0x00 (show setpoint)
+// Note: This command only works on Wall Thermostats
+func sendDisplayMode(dstAddr string, showActual bool) {
+	var payload byte = 0x00
+	if showActual {
+		payload = 0x04
+	}
+
+	displayStr := "setpoint"
+	if showActual {
+		displayStr = "actual"
+	}
+	sendCommand(dstAddr, 0x82, []byte{payload}, fmt.Sprintf("Set Display Mode: %s", displayStr))
 }

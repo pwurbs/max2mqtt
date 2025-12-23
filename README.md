@@ -154,6 +154,31 @@ To pair a new MAX! device:
     ```
 3.  The bridge will respond to pairing requests for 60 seconds.
 
+## Device Configuration
+
+After pairing devices, you can configure additional settings directly from Home Assistant.
+
+### Eco/Comfort Temperature
+
+Each thermostat exposes two Number entities for configuring the eco and comfort preset temperatures:
+
+- **Eco Temperature**: The temperature used when eco mode is activated (default: 17.0°C)
+- **Comfort Temperature**: The temperature used when comfort mode is activated (default: 21.0°C)
+
+> **⚠️ Important**: Do not use the up/down spinner buttons to adjust these values. Each click triggers a TX command with ACK handshake, which may block subsequent commands. Type the desired value directly and press Enter.
+Generally don't set too many values in short time. This could consume too much credits and block the bridge for a while.
+
+When changing these values, max2mqtt preserves the device's current configuration for other settings (max/min temperature, measurement offset, window open settings). On first use, sensible defaults are applied since the actual device config cannot be read via the CUL protocol.
+
+### Display Mode (Wall Thermostats Only)
+
+Wall thermostats can display either the **target/setpoint temperature** or the **actual measured temperature**. A dropdown selector is provided with two options:
+
+- **Setpoint**: Display shows target temperature
+- **Actual**: Display shows measured room temperature
+
+> **Note**: This setting appears for all devices but only affects Wall Thermostats. Radiator thermostats will ignore this command.
+
 
 ## Development
 

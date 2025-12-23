@@ -16,7 +16,7 @@ options:
   mqtt_user: ""
   mqtt_pass: ""
   gateway_id: "123456"
-  duty_cycle_min_credits: 100
+  duty_cycle_min_credits: 200
   command_timeout: "1m"
 schema:
   serial_port: str
