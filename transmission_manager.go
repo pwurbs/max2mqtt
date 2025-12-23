@@ -122,17 +122,23 @@ func (t *TransmissionManager) Enqueue(devicedID, payload, description string) {
 
 // dispatcherLoop consumes queued commands and dispatches them.
 // ACK waiting is handled in separate goroutines to allow parallel TX to different devices.
+// Broadcasts (deviceID=000000) skip ACK handling entirely.
 func (t *TransmissionManager) dispatcherLoop() {
 	for cmd := range t.queue {
+		// Handle broadcast messages (000000) - no ACK expected
+		isBroadcast := cmd.DeviceID == "000000"
+
 		// 1. Check Timeout before even querying
 		if time.Since(cmd.CreatedAt) > t.Timeout {
 			log.Warnf("Command to %s timed out (waited %s) due to duty cycle limits. Restoring state.", cmd.DeviceID, time.Since(cmd.CreatedAt))
-			t.restoreState(cmd.DeviceID)
+			if !isBroadcast {
+				t.restoreState(cmd.DeviceID)
+			}
 			continue
 		}
 
-		// 2. Check if device already has a pending TX - reject if busy
-		if t.IsPendingTX(cmd.DeviceID) {
+		// 2. Check if device already has a pending TX - reject if busy (skip for broadcasts)
+		if !isBroadcast && t.IsPendingTX(cmd.DeviceID) {
 			log.Warnf("TxMgr: Device %s busy (awaiting ACK). Rejecting command '%s'. Restoring state.", cmd.DeviceID, cmd.Description)
 			t.restoreState(cmd.DeviceID)
 			continue
@@ -191,7 +197,19 @@ func (t *TransmissionManager) dispatcherLoop() {
 		default:
 		}
 
-		// 7. All conditions met - mark device as busy and dispatch
+		// 7. All conditions met - dispatch the command
+		if isBroadcast {
+			// Broadcasts: send directly, no ACK handling
+			select {
+			case serialWrite <- cmd.Payload:
+				log.Infof("TxMgr: Broadcast dispatched: '%s' (Credits: %d, Queue: %d)", cmd.Description, credits, queueLen)
+			default:
+				log.Error("TxMgr: Serial write channel full! Dropping broadcast")
+			}
+			continue
+		}
+
+		// Regular commands: mark device as busy and wait for ACK
 		t.SetPendingTX(cmd.DeviceID)
 
 		// Create ACK channel BEFORE sending to prevent race condition where ACK arrives

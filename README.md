@@ -12,6 +12,10 @@ Designed to replace legacy FHEM installations with a lightweight, standalone ser
                 -   **Accepted**: Wall Thermostats (Type `0x70`, `0x42`) and extended Acks (Type `0x02` w/ Actual Temp).
                 -   **Ignored**: Radiator Thermostats (Type `0x60`) and standard Acks to prevent duplicate/partial data.
             -   **Payload**: Mode, Setpoint, and Actual Temperature.
+-   **Time Synchronization**: Automatically broadcasts time (Type `0x03`) to all paired devices:
+    -   On startup (after 10 second delay)
+    -   After each successful device pairing
+    -   Every 24 hours to keep device clocks accurate
 -   **Home Assistant Integration**:
     -   **Auto-Discovery**: Fully compliant with HA MQTT Discovery (Climate, Select, Binary Sensor).
     -   **Entities**:

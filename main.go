@@ -118,6 +118,9 @@ func main() {
 	serialWrite = make(chan string, 10)
 	go serialReaderLoop(serialChan, serialWrite)
 
+	// Start periodic time sync (broadcasts time on startup and every 24 hours)
+	go startPeriodicTimeSync()
+
 	// 4. Handle Signals
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
@@ -939,10 +942,16 @@ func sendCommand(dstAddr string, typeByte byte, payload []byte, description stri
 	// Fixed Header fields after Len: Cnt(1)+Flg(1)+Type(1)+Src(3)+Dst(3)+Grp(1) = 10 bytes
 	packetLen := 10 + len(payload)
 
+	// Flag: 0x04 for broadcasts, 0x00 for regular commands (per maxcul.js)
+	var flag byte = 0x00
+	if dstAddr == "000000" {
+		flag = 0x04
+	}
+
 	packet := make([]byte, 0, packetLen+1)
 	packet = append(packet, byte(packetLen))
 	packet = append(packet, byte(cnt))
-	packet = append(packet, 0x00) // Flag (Standard)
+	packet = append(packet, flag)
 	packet = append(packet, typeByte)
 	packet = append(packet, srcBytes...)
 	packet = append(packet, dstBytes...)
@@ -1012,6 +1021,12 @@ func sendPairPong(targetAddr string) {
 	select {
 	case serialWrite <- cmd:
 		log.Infof("Sent PairPong to %s (Cnt: %d)", targetAddr, cnt)
+		// Schedule time broadcast for newly paired device
+		log.Infof("Scheduling time broadcast for newly paired device %s", targetAddr)
+		go func() {
+			time.Sleep(2 * time.Second)
+			sendTimeBroadcast()
+		}()
 	default:
 		log.Error("Serial write queue full")
 	}
@@ -1143,4 +1158,45 @@ func sendDisplayMode(dstAddr string, showActual bool) {
 		displayStr = "actual"
 	}
 	sendCommand(dstAddr, 0x82, []byte{payload}, fmt.Sprintf("Set Display Mode: %s", displayStr))
+}
+
+// sendTimeBroadcast sends Type 0x03 TimeInformation to broadcast address 000000
+// All devices paired with this gateway will receive and accept this message.
+// Payload format (5 bytes):
+//   - Byte 0: Year (since 2000)
+//   - Byte 1: Day of month
+//   - Byte 2: Hour
+//   - Byte 3: Minute | ((Month & 0x0C) << 4)
+//   - Byte 4: Second | ((Month & 0x03) << 6)
+func sendTimeBroadcast() {
+	now := time.Now()
+	year := byte(now.Year() - 2000)
+	month := byte(now.Month())
+	day := byte(now.Day())
+	hour := byte(now.Hour())
+	min := byte(now.Minute())
+	sec := byte(now.Second())
+
+	compressedOne := min | ((month & 0x0C) << 4)
+	compressedTwo := sec | ((month & 0x03) << 6)
+
+	payload := []byte{year, day, hour, compressedOne, compressedTwo}
+
+	log.Infof("Broadcasting time sync: %d-%02d-%02d %02d:%02d:%02d",
+		now.Year(), month, day, hour, min, sec)
+
+	sendCommand("000000", 0x03, payload, "Time Broadcast")
+}
+
+// startPeriodicTimeSync starts a goroutine that broadcasts time on startup
+// and then every 24 hours to keep all paired devices synchronized.
+func startPeriodicTimeSync() {
+	// Initial delay to allow serial connection to be established
+	time.Sleep(10 * time.Second)
+
+	for {
+		log.Info("Sending periodic time broadcast")
+		sendTimeBroadcast()
+		time.Sleep(24 * time.Hour)
+	}
 }
