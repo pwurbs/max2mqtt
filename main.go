@@ -223,6 +223,7 @@ func setupMQTT() {
 		c.Subscribe("max/+/eco_temp/set", 0, handleMQTTEcoTemp)
 		c.Subscribe("max/+/comfort_temp/set", 0, handleMQTTComfortTemp)
 		c.Subscribe("max/+/display_mode/set", 0, handleMQTTDisplayMode)
+		c.Subscribe("max/+/associate", 0, handleMQTTAssociate)
 	})
 
 	mqttClient = mqtt.NewClient(opts)
@@ -966,7 +967,9 @@ func sendCommand(dstAddr string, typeByte byte, payload []byte, description stri
 	cmd := "Zs" + hexStr
 
 	if txMgr != nil {
-		txMgr.Enqueue(dstAddr, cmd, description)
+		// Include counter in description for debugging
+		descWithCnt := fmt.Sprintf("%s (Cnt:%d)", description, cnt)
+		txMgr.Enqueue(dstAddr, cmd, descWithCnt)
 	} else {
 		// Fallback if not init (should not happen)
 		select {
@@ -1199,4 +1202,110 @@ func startPeriodicTimeSync() {
 		sendTimeBroadcast()
 		time.Sleep(24 * time.Hour)
 	}
+}
+
+// handleMQTTAssociate links two MAX! devices together (device-to-device association)
+// Topic: max/<source_device>/associate
+// Payload: <partner_device_id> or <partner_device_id>:<partner_type>
+// Partner types: 1=HeatingThermostat, 2=HeatingThermostatPlus, 3=WallMountedThermostat, 4=ShutterContact, 5=PushButton
+// If partner_type is omitted, defaults to 1 (radiator thermostat)
+//
+// Example: To link radiator 0A1B2C with wall thermostat 0D3E4F:
+//
+//	mosquitto_pub -t "max/0A1B2C/associate" -m "0D3E4F:3"  # Tell radiator about wall (type 3)
+//	mosquitto_pub -t "max/0D3E4F/associate" -m "0A1B2C:1"  # Tell wall about radiator (type 1)
+//
+// Note: Association must be done in BOTH directions for devices to work together.
+func handleMQTTAssociate(client mqtt.Client, msg mqtt.Message) {
+	topicParts := strings.Split(msg.Topic(), "/")
+	if len(topicParts) < 3 {
+		return
+	}
+	srcDevice := topicParts[1]
+	payload := string(msg.Payload())
+
+	// Validate source device address (6 hex chars)
+	if len(srcDevice) != 6 {
+		log.Errorf("Invalid source device address: %s (must be 6 hex characters)", srcDevice)
+		return
+	}
+
+	// Parse payload: "<partner_id>" or "<partner_id>:<type>"
+	var partnerDevice string
+	var partnerType byte = 1 // Default to HeatingThermostat
+
+	if strings.Contains(payload, ":") {
+		parts := strings.Split(payload, ":")
+		if len(parts) != 2 {
+			log.Errorf("Invalid associate payload format: %s (expected 'device_id' or 'device_id:type')", payload)
+			return
+		}
+		partnerDevice = strings.TrimSpace(parts[0])
+		typeVal, err := strconv.Atoi(strings.TrimSpace(parts[1]))
+		if err != nil || typeVal < 1 || typeVal > 5 {
+			log.Errorf("Invalid partner type: %s (must be 1-5)", parts[1])
+			return
+		}
+		partnerType = byte(typeVal)
+	} else {
+		partnerDevice = strings.TrimSpace(payload)
+	}
+
+	// Validate partner device address
+	if len(partnerDevice) != 6 {
+		log.Errorf("Invalid partner device address: %s (must be 6 hex characters)", partnerDevice)
+		return
+	}
+
+	// Convert to uppercase for consistency
+	srcDevice = strings.ToUpper(srcDevice)
+	partnerDevice = strings.ToUpper(partnerDevice)
+
+	log.Infof("Associating device %s with partner %s (type %d)", srcDevice, partnerDevice, partnerType)
+
+	sendAddLinkPartner(srcDevice, partnerDevice, partnerType)
+}
+
+// sendAddLinkPartner sends Type 0x20 AddLinkPartner command
+// Links srcDevice to partnerDevice so they communicate with each other
+// partnerType values:
+//   - 1: Heating Thermostat (radiator valve)
+//   - 2: Heating Thermostat Plus
+//   - 3: Wall Mounted Thermostat
+//   - 4: Shutter Contact
+//   - 5: Push Button
+//
+// Payload structure (4 bytes):
+//   - Byte 0: Room Nr (0x00 for devices not in a room group)
+//   - Bytes 1-3: Partner RF Address (3 bytes)
+//   - Byte 4: Partner Type
+func sendAddLinkPartner(srcDevice, partnerDevice string, partnerType byte) {
+	partnerBytes, err := hex.DecodeString(partnerDevice)
+	if err != nil || len(partnerBytes) != 3 {
+		log.Errorf("Invalid partner device address: %s", partnerDevice)
+		return
+	}
+
+	// Payload: RoomNr(1) + PartnerAddr(3) + PartnerType(1) = 5 bytes
+	payload := make([]byte, 5)
+	payload[0] = 0x00 // Room Nr (0 = not in a room group)
+	payload[1] = partnerBytes[0]
+	payload[2] = partnerBytes[1]
+	payload[3] = partnerBytes[2]
+	payload[4] = partnerType
+
+	typeNames := map[byte]string{
+		1: "HeatingThermostat",
+		2: "HeatingThermostatPlus",
+		3: "WallMountedThermostat",
+		4: "ShutterContact",
+		5: "PushButton",
+	}
+	typeName := typeNames[partnerType]
+	if typeName == "" {
+		typeName = fmt.Sprintf("Unknown(%d)", partnerType)
+	}
+
+	description := fmt.Sprintf("AddLinkPartner %s -> %s (%s)", srcDevice, partnerDevice, typeName)
+	sendCommand(srcDevice, 0x20, payload, description)
 }

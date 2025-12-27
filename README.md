@@ -23,6 +23,7 @@ Designed to replace legacy FHEM installations with a lightweight, standalone ser
         -   **Select**: Dedicated "Mode" selector (Auto/Manual/Boost/Vacation).
         -   **Sensors**: Battery (Binary OK/Low).
     -   **Pairing Mode**: Trigger via MQTT (`max/bridge/pair`) to pair new devices.
+    -   **Retained Messages**: All MQTT messages (discovery and state) are published with the `retain` flag. This ensures Home Assistant keeps entities and their last known values across bridge or HA restarts.
 -   **Duty Cycle Management**: 
     -   Adheres to 868MHz 1% transmission limits using CUL's credit system.
     -   Before each TX: queries CUL credits and queue status (`X` command).
@@ -182,6 +183,39 @@ Wall thermostats can display either the **target/setpoint temperature** or the *
 - **Actual**: Display shows measured room temperature
 
 > **Note**: This setting appears for all devices but only affects Wall Thermostats. Radiator thermostats will ignore this command.
+
+### Device Association (Linking Devices)
+
+You can link MAX! devices together so they work as a team. For example, linking a **radiator thermostat** with a **wall thermostat** allows the wall thermostat to control the radiator valve based on the room temperature it measures.
+
+> **Important**: Association must be done **in both directions**. Each device needs to know about the other.
+
+**Partner Type Values:**
+| Type | Device |
+|------|--------|
+| 1 | Heating Thermostat (radiator valve) |
+| 2 | Heating Thermostat Plus |
+| 3 | Wall Mounted Thermostat |
+| 4 | Shutter Contact |
+| 5 | Push Button |
+
+**Example: Link radiator `0A1B2C` with wall thermostat `0D3E4F`:**
+
+```bash
+# Step 1: Tell the radiator about the wall thermostat (type 3)
+mosquitto_pub -h homeassistant -t "max/0A1B2C/associate" -m "0D3E4F:3"
+
+# Step 2: Tell the wall thermostat about the radiator (type 1)
+mosquitto_pub -h homeassistant -t "max/0D3E4F/associate" -m "0A1B2C:1"
+```
+
+Or via **Home Assistant Developer Tools → Services → MQTT: Publish**:
+| Field | Value |
+|-------|-------|
+| Topic | `max/0A1B2C/associate` |
+| Payload | `0D3E4F:3` |
+
+> **Note**: If you omit the partner type (e.g., just `0D3E4F`), it defaults to type 1 (radiator thermostat).
 
 
 ## Development
