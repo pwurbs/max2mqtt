@@ -12,10 +12,11 @@ Designed to replace legacy FHEM installations with a lightweight, standalone ser
                 -   **Accepted**: Wall Thermostats (Type `0x70`, `0x42`) and extended Acks (Type `0x02` w/ Actual Temp).
                 -   **Ignored**: Radiator Thermostats (Type `0x60`) and standard Acks to prevent duplicate/partial data.
             -   **Payload**: Mode, Setpoint, and Actual Temperature.
--   **Time Synchronization**: Automatically broadcasts time (Type `0x03`) to all paired devices:
-    -   On startup (after 10 second delay)
-    -   After each successful device pairing
-    -   Every 24 hours to keep device clocks accurate
+-   **Time Synchronization**: Automatically syncs time (Type `0x03`) with devices:
+    -   On startup: broadcasts to all devices (after 10 second delay)
+    -   After pairing: sends directly to the newly paired device
+    -   On device request: responds when a device sends a TimeInformation request
+    -   Every 24 hours: broadcasts to all devices to keep clocks accurate
 -   **Home Assistant Integration**:
     -   **Auto-Discovery**: Fully compliant with HA MQTT Discovery (Climate, Select, Binary Sensor).
     -   **Entities**:
@@ -77,7 +78,7 @@ This bridge implements a strict filter to ensure high-quality data and avoid sta
 -   **Standard Acknowledgements (`0x02`)**:
     -   **Description**: Short Acks (< 6 bytes).
     -   **Reason**: Contain redundant info (Mode/Setpoint) already captured by `0x70` messages. Ignored to reduce MQTT noise.
--   **Shutter Contacts (`0x30`)** & **Time Info (`0x03`)**:
+-   **Shutter Contacts (`0x30`)**:
     -   **Reason**: Out of scope for this climate-focused bridge.
 
 ## Deployment

@@ -401,6 +401,14 @@ func handleSerialMessage(raw string) {
 		return
 	}
 
+	// Check if this is a TimeInformation request (Type 0x03)
+	// Devices send this to request current time from the gateway
+	if pkt.Type == 0x03 {
+		log.Infof("Received TimeInformation request from %s, sending time...", pkt.SrcAddr)
+		sendTimeToDevice(pkt.SrcAddr)
+		return
+	}
+
 	// Notify ACK received for TX handshaking (Type 0x02 = ACK)
 	// Do this immediately to unblock pending TX, regardless of payload length/validity for state.
 	// We also accept 0x70 (Wall), 0x60 (Rad), and 0x42 (WallCtrl) as implicit ACKs,
@@ -414,6 +422,7 @@ func handleSerialMessage(raw string) {
 	// Message Type Reference (from FHEM 10_MAX.pm):
 	// 0x00 = PairPing
 	// 0x02 = Ack (contains state data)
+	// 0x03 = TimeInformation (request from device or broadcast from gateway)
 	// 0x60 = ThermostatState (HeatingThermostat) - IGNORED
 	// 0x70 = WallThermostatState (WallMountedThermostat)
 	// 0x42 = WallThermostatControl
@@ -1024,11 +1033,11 @@ func sendPairPong(targetAddr string) {
 	select {
 	case serialWrite <- cmd:
 		log.Infof("Sent PairPong to %s (Cnt: %d)", targetAddr, cnt)
-		// Schedule time broadcast for newly paired device
-		log.Infof("Scheduling time broadcast for newly paired device %s", targetAddr)
+		// Schedule time sync for newly paired device (direct, not broadcast)
+		log.Infof("Scheduling time sync for newly paired device %s", targetAddr)
 		go func() {
 			time.Sleep(2 * time.Second)
-			sendTimeBroadcast()
+			sendTimeToDevice(targetAddr)
 		}()
 	default:
 		log.Error("Serial write queue full")
@@ -1189,6 +1198,28 @@ func sendTimeBroadcast() {
 		now.Year(), month, day, hour, min, sec)
 
 	sendCommand("000000", 0x03, payload, "Time Broadcast")
+}
+
+// sendTimeToDevice sends Type 0x03 TimeInformation to a specific device address
+// This is used to respond to time requests from devices or to sync time after pairing
+func sendTimeToDevice(dstAddr string) {
+	now := time.Now()
+	year := byte(now.Year() - 2000)
+	month := byte(now.Month())
+	day := byte(now.Day())
+	hour := byte(now.Hour())
+	min := byte(now.Minute())
+	sec := byte(now.Second())
+
+	compressedOne := min | ((month & 0x0C) << 4)
+	compressedTwo := sec | ((month & 0x03) << 6)
+
+	payload := []byte{year, day, hour, compressedOne, compressedTwo}
+
+	log.Infof("Sending time to %s: %d-%02d-%02d %02d:%02d:%02d",
+		dstAddr, now.Year(), month, day, hour, min, sec)
+
+	sendCommand(dstAddr, 0x03, payload, fmt.Sprintf("Time to %s", dstAddr))
 }
 
 // startPeriodicTimeSync starts a goroutine that broadcasts time on startup
