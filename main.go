@@ -1275,10 +1275,9 @@ func handleMQTTAssociate(client mqtt.Client, msg mqtt.Message) {
 //   - 4: Shutter Contact
 //   - 5: Push Button
 //
-// Payload structure (4 bytes):
-//   - Byte 0: Room Nr (0x00 for devices not in a room group)
-//   - Bytes 1-3: Partner RF Address (3 bytes)
-//   - Byte 4: Partner Type
+// Payload structure (4 bytes) per FHEM reference:
+//   - Bytes 0-2: Partner RF Address (3 bytes)
+//   - Byte 3: Partner Type
 func sendAddLinkPartner(srcDevice, partnerDevice string, partnerType byte) {
 	partnerBytes, err := hex.DecodeString(partnerDevice)
 	if err != nil || len(partnerBytes) != 3 {
@@ -1286,13 +1285,12 @@ func sendAddLinkPartner(srcDevice, partnerDevice string, partnerType byte) {
 		return
 	}
 
-	// Payload: RoomNr(1) + PartnerAddr(3) + PartnerType(1) = 5 bytes
-	payload := make([]byte, 5)
-	payload[0] = 0x00 // Room Nr (0 = not in a room group)
-	payload[1] = partnerBytes[0]
-	payload[2] = partnerBytes[1]
-	payload[3] = partnerBytes[2]
-	payload[4] = partnerType
+	// Payload: PartnerAddr(3) + PartnerType(1) = 4 bytes
+	payload := make([]byte, 4)
+	payload[0] = partnerBytes[0]
+	payload[1] = partnerBytes[1]
+	payload[2] = partnerBytes[2]
+	payload[3] = partnerType
 
 	typeNames := map[byte]string{
 		1: "HeatingThermostat",
