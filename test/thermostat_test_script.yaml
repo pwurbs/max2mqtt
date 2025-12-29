@@ -1,0 +1,133 @@
+# Thermostat Setpoint Test Script for Home Assistant
+# This script tests if setting target temperatures works correctly
+#
+# Usage:
+# 1. Configure the variables below (thermostat entities, timing)
+# 2. Copy content below into your scripts.yaml
+# 3. Trigger via Developer Tools → Services or create a dashboard button
+#
+# Test behavior:
+# - Runs for 1 hour (iterations calculated from cycle time)
+# - Sets random temperature on both thermostats each cycle
+# - Waits configured time then verifies the setpoint was applied
+# - Sends notifications for failures and a summary at the end
+
+thermostat_setpoint_test:
+  alias: "Thermostat Setpoint Test"
+  mode: single
+  variables:
+    # ==========================================================================
+    # CONFIGURATION - Modify these values
+    # ==========================================================================
+    # Thermostat entity IDs to test
+    thermostat_1: "climate.thermostat_1"  # TODO: Replace with your entity ID
+    thermostat_2: "climate.thermostat_2"  # TODO: Replace with your entity ID
+    
+    # Temperature range for random setpoints
+    temp_min: 16
+    temp_max: 25
+    
+    # Wait time: seconds to wait after setting temp before checking
+    wait_seconds: 120
+    
+    # Cycle interval: total seconds per test cycle
+    cycle_seconds: 180
+    
+    # ==========================================================================
+    # CALCULATED VALUES - Do not modify
+    # ==========================================================================
+    remaining_seconds: "{{ cycle_seconds - wait_seconds }}"
+    iterations: "{{ (3600 / cycle_seconds) | int }}"
+  sequence:
+    - service: input_boolean.turn_on
+      target:
+        entity_id: input_boolean.thermostat_test_running
+    - service: counter.reset
+      target:
+        entity_id:
+          - counter.thermostat_test_success
+          - counter.thermostat_test_failure
+
+    # Run for 1 hour (iterations calculated from cycle time)
+    - repeat:
+        count: "{{ iterations }}"
+        sequence:
+          # Generate random setpoints for both thermostats
+          - variables:
+              setpoint_1: "{{ temp_min + (range(0, ((temp_max - temp_min) * 2) | int + 1) | random) * 0.5 }}"
+              setpoint_2: "{{ temp_min + (range(0, ((temp_max - temp_min) * 2) | int + 1) | random) * 0.5 }}"
+
+          # Set temperature on both thermostats
+          - service: climate.set_temperature
+            target:
+              entity_id: "{{ thermostat_1 }}"
+            data:
+              temperature: "{{ setpoint_1 }}"
+          - service: climate.set_temperature
+            target:
+              entity_id: "{{ thermostat_2 }}"
+            data:
+              temperature: "{{ setpoint_2 }}"
+
+          # Wait for command to propagate
+          - delay:
+              seconds: "{{ wait_seconds }}"
+
+          # Check thermostat 1
+          - choose:
+              - conditions:
+                  - condition: template
+                    value_template: >
+                      {{ state_attr(thermostat_1, 'temperature') | float == setpoint_1 | float }}
+                sequence:
+                  - service: counter.increment
+                    target:
+                      entity_id: counter.thermostat_test_success
+            default:
+              - service: counter.increment
+                target:
+                  entity_id: counter.thermostat_test_failure
+              - service: notify.persistent_notification
+                data:
+                  title: "❌ Thermostat Test Failed"
+                  message: >
+                    {{ thermostat_1 }}: Expected {{ setpoint_1 }}°C,
+                    got {{ state_attr(thermostat_1, 'temperature') }}°C
+
+          # Check thermostat 2
+          - choose:
+              - conditions:
+                  - condition: template
+                    value_template: >
+                      {{ state_attr(thermostat_2, 'temperature') | float == setpoint_2 | float }}
+                sequence:
+                  - service: counter.increment
+                    target:
+                      entity_id: counter.thermostat_test_success
+            default:
+              - service: counter.increment
+                target:
+                  entity_id: counter.thermostat_test_failure
+              - service: notify.persistent_notification
+                data:
+                  title: "❌ Thermostat Test Failed"
+                  message: >
+                    {{ thermostat_2 }}: Expected {{ setpoint_2 }}°C,
+                    got {{ state_attr(thermostat_2, 'temperature') }}°C
+
+          # Wait remaining time to complete the cycle
+          - delay:
+              seconds: "{{ remaining_seconds }}"
+
+    # Test complete - send summary
+    - service: notify.persistent_notification
+      data:
+        title: "🧪 Thermostat Test Complete"
+        message: >
+          Test finished after 1 hour ({{ iterations }} cycles × {{ cycle_seconds }}s).
+          ✅ Success: {{ states('counter.thermostat_test_success') }}
+          ❌ Failures: {{ states('counter.thermostat_test_failure') }}
+
+    - service: input_boolean.turn_off
+      target:
+        entity_id: input_boolean.thermostat_test_running

@@ -53,7 +53,7 @@ func initTransmissionManager() {
 	// Parse Timeout
 	timeout, err := time.ParseDuration(config.CommandTimeout)
 	if err != nil {
-		log.Warnf("Invalid CommandTimeout '%s', defaulting to 1m", config.CommandTimeout)
+		log.Warnf("Invalid CommandTimeout '%s', defaulting to 2m", config.CommandTimeout)
 		timeout = 1 * time.Minute
 	}
 

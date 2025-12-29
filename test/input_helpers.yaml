@@ -1,0 +1,17 @@
+# =============================================================================
+# Thermostat Setpoint Test - Required Helpers
+# =============================================================================
+# Add these to your configuration.yaml
+# After adding, restart Home Assistant to create the entities
+
+# Tracks if test is currently running
+input_boolean:
+  thermostat_test_running:
+    name: Thermostat Test Running
+
+# Counts successful and failed verifications
+counter:
+  thermostat_test_success:
+    name: Test Success Count
+  thermostat_test_failure:
+    name: Test Failure Count
