@@ -140,27 +140,37 @@ func main() {
 func loadConfig() {
 	// Defaults
 	config = Config{
-		SerialPort:          "/dev/ttyACM0",
+		SerialPort:          "/dev/serial/by-id/usb-SHK_NANO_CUL_868-if00-port0",
 		BaudRate:            38400,
 		MQTTBroker:          "tcp://homeassistant:1883",
 		LogLevel:            "info",
 		GatewayID:           "123456",
 		DutyCycleMinCredits: 100,
-		CommandTimeout:      "2m",
+		CommandTimeout:      "1m",
 	}
 
 	// Try loading from options.json (Standard HA Add-on location)
-	if _, err := os.Stat("/data/options.json"); err == nil {
-		data, err := os.ReadFile("/data/options.json")
-		if err == nil {
-			log.Info("Loading config from /data/options.json")
-			// We define a temporary struct because HA Add-on options might be flat or nested
-			// Usually they are flat key-values.
-			_ = json.Unmarshal(data, &config)
-		}
-	}
+	loadConfigFromFile()
 
 	// Override with Env Vars (Standard Docker pattern)
+	loadEnvOverrides()
+}
+
+// loadConfigFromFile loads config from HA Add-on options.json if present
+func loadConfigFromFile() {
+	if _, err := os.Stat("/data/options.json"); err != nil {
+		return
+	}
+	data, err := os.ReadFile("/data/options.json")
+	if err != nil {
+		return
+	}
+	log.Info("Loading config from /data/options.json")
+	_ = json.Unmarshal(data, &config)
+}
+
+// loadEnvOverrides applies environment variable overrides to config
+func loadEnvOverrides() {
 	if v := os.Getenv("SERIAL_PORT"); v != "" {
 		config.SerialPort = v
 	}
@@ -235,88 +245,111 @@ func setupMQTT() {
 // Serial Reader Loop with Reconnection
 func serialReaderLoop(out chan<- string, in <-chan string) {
 	for {
-		// mode := &serial.Mode{
-		// 	BaudRate: config.BaudRate,
-		// }
-		mode := &serial.Mode{
-			BaudRate: config.BaudRate,
-			DataBits: 8,
-			Parity:   serial.NoParity,
-			StopBits: serial.OneStopBit,
-		}
-		port, err := serial.Open(config.SerialPort, mode)
-		if err != nil {
-			log.Errorf("Failed to open serial port %s: %v. Retrying in 5s...", config.SerialPort, err)
+		port := openSerialPort()
+		if port == nil {
 			time.Sleep(5 * time.Second)
 			continue
 		}
-		log.Infof("Opened serial port %s", config.SerialPort)
 
-		// Allow reliable device startup/reboot time (Increased to 4s for NanoCULs)
-		time.Sleep(4 * time.Second)
-
-		// Clear any garbage from boot process
-		port.ResetInputBuffer()
-
-		// Send Initialization Commands
-		// V   = Version Check (Tests comms)
-		// Zr  = Enable MAX! Sniffer Mode (Critical)
-		// X   = Query Credits
-		initCmds := []string{"V", "Zr", "X"}
-		for _, cmd := range initCmds {
-			log.Infof("Sending Init Command: %s", cmd)
-			if _, err := port.Write([]byte(cmd + "\r")); err != nil {
-				log.Errorf("Failed to send init command %s: %v", cmd, err)
-			}
-			// Small delay between commands
-			time.Sleep(500 * time.Millisecond)
-		}
+		initializeCUL(port)
 
 		// Start Writer Routine for this connection
 		stopWriter := make(chan struct{})
-		go func() {
-			for {
-				select {
-				case cmd := <-in:
-					log.Debugf("TX: %s", cmd)
-					// Use \r only for consistency
-					if _, err := port.Write([]byte(cmd + "\r")); err != nil {
-						log.Errorf("Failed to write to serial: %v", err)
-						return // Reader loop will detect error/close
-					}
-				case <-stopWriter:
-					return
-				}
-			}
-		}()
+		go startSerialWriter(port, in, stopWriter)
 
+		// Read loop
 		scanner := bufio.NewScanner(port)
 		for scanner.Scan() {
-			text := scanner.Text()
-			log.Debugf("RX: %s", text)
-			if strings.HasPrefix(text, string(MaxMsgStart)) {
-				out <- text
-			} else if text == "LOVF" {
-				// LOVF = Limit Of Voice Full - CUL TX buffer overflow
-				log.Warn("CUL: LOVF (Limit Of Voice Full) - TX buffer overflow")
-				if txMgr != nil {
-					txMgr.SignalLOVF()
-				}
-			} else if txMgr != nil {
-				// Check for Credit Report: "yy xxx" (e.g., "00 900")
-				// Delegated to TransmissionManager's parser
-				queueLen, credits, matched := ParseCreditResponse(text)
-				if matched {
-					txMgr.UpdateCredits(credits, queueLen)
-					txMgr.SignalCreditResponse()
-				}
-			}
+			processSerialLine(scanner.Text(), out)
 		}
 
 		close(stopWriter)
 		log.Warn("Serial connection lost or closed. Reconnecting...")
 		port.Close()
 		time.Sleep(2 * time.Second)
+	}
+}
+
+// openSerialPort attempts to open the configured serial port.
+// Returns nil if the port could not be opened.
+func openSerialPort() serial.Port {
+	mode := &serial.Mode{
+		BaudRate: config.BaudRate,
+		DataBits: 8,
+		Parity:   serial.NoParity,
+		StopBits: serial.OneStopBit,
+	}
+	port, err := serial.Open(config.SerialPort, mode)
+	if err != nil {
+		log.Errorf("Failed to open serial port %s: %v. Retrying in 5s...", config.SerialPort, err)
+		return nil
+	}
+	log.Infof("Opened serial port %s", config.SerialPort)
+	return port
+}
+
+// initializeCUL sends initialization commands to the CUL device
+func initializeCUL(port serial.Port) {
+	// Allow reliable device startup/reboot time (Increased to 4s for NanoCULs)
+	time.Sleep(4 * time.Second)
+
+	// Clear any garbage from boot process
+	port.ResetInputBuffer()
+
+	// Send Initialization Commands
+	// V   = Version Check (Tests comms)
+	// Zr  = Enable MAX! Sniffer Mode (Critical)
+	// X   = Query Credits
+	initCmds := []string{"V", "Zr", "X"}
+	for _, cmd := range initCmds {
+		log.Infof("Sending Init Command: %s", cmd)
+		if _, err := port.Write([]byte(cmd + "\r")); err != nil {
+			log.Errorf("Failed to send init command %s: %v", cmd, err)
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+}
+
+// startSerialWriter runs the serial write loop until stopWriter is closed
+func startSerialWriter(port serial.Port, in <-chan string, stopWriter <-chan struct{}) {
+	for {
+		select {
+		case cmd := <-in:
+			log.Debugf("TX: %s", cmd)
+			if _, err := port.Write([]byte(cmd + "\r")); err != nil {
+				log.Errorf("Failed to write to serial: %v", err)
+				return
+			}
+		case <-stopWriter:
+			return
+		}
+	}
+}
+
+// processSerialLine handles a single line received from the serial port
+func processSerialLine(text string, out chan<- string) {
+	log.Debugf("RX: %s", text)
+
+	if strings.HasPrefix(text, string(MaxMsgStart)) {
+		out <- text
+		return
+	}
+
+	if text == "LOVF" {
+		log.Warn("CUL: LOVF (Limit Of Voice Full) - TX buffer overflow")
+		if txMgr != nil {
+			txMgr.SignalLOVF()
+		}
+		return
+	}
+
+	// Check for Credit Report: "yy xxx" (e.g., "00 900")
+	if txMgr != nil {
+		queueLen, credits, matched := ParseCreditResponse(text)
+		if matched {
+			txMgr.UpdateCredits(credits, queueLen)
+			txMgr.SignalCreditResponse()
+		}
 	}
 }
 
@@ -522,84 +555,65 @@ func (d *MaxDeviceData) String() string {
 // decodePayload parses the MAX! thermostat state payload
 // Based on references/protocol
 func decodePayload(pkt *MaxPacket) *MaxDeviceData {
-	// Protocol:
-	// Type 0x02, 0x70, 0x60: Thermostat Status (Mode, Valve, Setpoint, Optional Actual)
-	// Type 0x42: WallThermostatControl (Setpoint, Actual Temp)
-	// Type 0x40: SetTemperature (Mode, Setpoint)
-	if pkt.Type != 0x02 && pkt.Type != 0x70 && pkt.Type != 0x60 && pkt.Type != 0x42 && pkt.Type != 0x40 {
+	switch pkt.Type {
+	case 0x42:
+		return decodeWallThermostatControl(pkt.Payload)
+	case 0x40:
+		return decodeSetTemperature(pkt.Payload)
+	case 0x02, 0x60, 0x70:
+		return decodeThermostatStatus(pkt.Type, pkt.Payload)
+	default:
 		return nil
 	}
+}
 
-	payload := pkt.Payload
+// decodeWallThermostatControl decodes Type 0x42 (WallThermostatControl)
+// Payload: [SetpointRaw] [ActualTempRaw]
+func decodeWallThermostatControl(payload []byte) *MaxDeviceData {
+	if len(payload) < 2 {
+		return nil
+	}
 	data := &MaxDeviceData{}
 
-	// Handle 0x42 (WallThermostatControl)
-	// Payload: [SetpointRaw] [ActualTempRaw]
-	if pkt.Type == 0x42 {
-		if len(payload) < 2 {
-			return nil
-		}
-		// Byte 0: Setpoint (Bits 0-6) / 2
-		// Bit 7 is likely Mode-related or just ignored in simple control packets?
-		// FHEM uses: ($payload[0] & 0x7F) / 2
-		data.Temperature = float64(payload[0]&0x7F) / 2.0
+	// Byte 0: Setpoint (Bits 0-6) / 2
+	data.Temperature = float64(payload[0]&0x7F) / 2.0
 
-		// Byte 1: Actual Temperature (Raw / 10)
-		// FHEM uses: $payload[1] / 10
-		// Note: Protocol usually has 9th bit for temp in Byte 0 MSB?
-		// For 0x42, it seems simpler: just Byte 1.
-		actual := float64(payload[1]) / 10.0
-		data.CurrentTemperature = &actual
+	// Byte 1: Actual Temperature (Raw / 10)
+	actual := float64(payload[1]) / 10.0
+	data.CurrentTemperature = &actual
 
-		return data
+	return data
+}
+
+// decodeSetTemperature decodes Type 0x40 (SetTemperature)
+// Payload: [TargetTemp/Mode] - Bits 0-5: Temp/2, Bits 6-7: Mode
+func decodeSetTemperature(payload []byte) *MaxDeviceData {
+	if len(payload) < 1 {
+		return nil
+	}
+	data := &MaxDeviceData{}
+	byte0 := payload[0]
+
+	// Mode from bits 6-7
+	modeBits := (byte0 >> 6) & 0x03
+	applyModeFromBits(data, modeBits)
+
+	// Temperature from bits 0-5
+	data.Temperature = float64(byte0&0x3F) / 2.0
+
+	// Special case: Off (4.5C in manual mode)
+	if data.Mode == "manual" && data.Temperature <= 4.5 {
+		data.HVACMode = "off"
 	}
 
-	// Handle 0x40 (SetTemperature)
-	// Payload: [TargetTemp/Mode]
-	if pkt.Type == 0x40 {
-		if len(payload) < 1 {
-			return nil
-		}
-		// Byte 0:
-		// Bits 0-5: Temp / 2
-		// Bits 6-7: Mode
-		byte0 := payload[0]
+	return data
+}
 
-		// Mode
-		modeBits := (byte0 >> 6) & 0x03
-		switch modeBits {
-		case 0:
-			data.Mode = "auto"
-			data.HVACMode = "auto"
-		case 1:
-			data.Mode = "manual"
-			data.HVACMode = "heat"
-		case 2:
-			data.Mode = "vacation"
-			data.HVACMode = "off"
-		case 3:
-			data.Mode = "boost"
-			data.HVACMode = "heat"
-		}
-
-		// Temperature
-		// Formula: (Byte & 0x3F) / 2
-		tempRaw := byte0 & 0x3F
-		data.Temperature = float64(tempRaw) / 2.0
-
-		// Special case: Off (4.5C)
-		if data.Mode == "manual" && data.Temperature <= 4.5 {
-			data.HVACMode = "off"
-		}
-
-		return data
-	}
-
-	// Handle 0x02, 0x70
-
-	// Fix for Type 0x02 ("Ack/Status"): The first byte is a generic status/ack,
-	// followed by the actual payload (Mode/Valve/Temp).
-	if pkt.Type == 0x02 {
+// decodeThermostatStatus decodes Type 0x02, 0x60, 0x70 (Thermostat Status)
+// Contains Mode, Battery, Setpoint, and optionally Actual Temperature
+func decodeThermostatStatus(pktType int, payload []byte) *MaxDeviceData {
+	// For Type 0x02, skip the first byte (generic status/ack)
+	if pktType == 0x02 {
 		if len(payload) < 1 {
 			return nil
 		}
@@ -610,10 +624,39 @@ func decodePayload(pkt *MaxPacket) *MaxDeviceData {
 		return nil
 	}
 
-	// Byte 0: Mode & Battery
-	// Bits 0-1 (Mode): 00=Auto, 01=Manual, 10=Vacation, 11=Boost
-	// Bit 7 (Battery): 1=Low Battery
+	data := &MaxDeviceData{}
+
+	// Byte 0: Mode (bits 0-1) & Battery (bit 7)
 	modeBits := payload[0] & 0x03
+	applyModeFromBits(data, modeBits)
+
+	if (payload[0] & 0x80) != 0 {
+		data.Battery = "low"
+	} else {
+		data.Battery = "ok"
+	}
+
+	// Byte 2: Setpoint Temperature
+	data.Temperature = float64(payload[2]&0x7F) / 2.0
+
+	// Special case: Off (4.5C in manual mode)
+	if data.Mode == "manual" && data.Temperature <= 4.5 {
+		data.HVACMode = "off"
+	}
+
+	// Bytes 3-4: Actual Temperature (if present)
+	if len(payload) >= 5 {
+		rawTemp := int(payload[3]&0x01)<<8 | int(payload[4])
+		actualTemp := float64(rawTemp) / 10.0
+		data.CurrentTemperature = &actualTemp
+	}
+
+	return data
+}
+
+// applyModeFromBits sets Mode and HVACMode based on mode bits
+// Mode bits: 00=Auto, 01=Manual, 10=Vacation, 11=Boost
+func applyModeFromBits(data *MaxDeviceData, modeBits byte) {
 	switch modeBits {
 	case 0:
 		data.Mode = "auto"
@@ -628,38 +671,6 @@ func decodePayload(pkt *MaxPacket) *MaxDeviceData {
 		data.Mode = "boost"
 		data.HVACMode = "heat"
 	}
-
-	if (payload[0] & 0x80) != 0 {
-		data.Battery = "low"
-	} else {
-		data.Battery = "ok"
-	}
-
-	// Byte 2: Setpoint Temperature
-	// Formula: (Byte & 0x7F) / 2
-	setpointRaw := payload[2] & 0x7F
-	data.Temperature = float64(setpointRaw) / 2.0
-
-	// Special case: If Mode is manual (heat) but Temp is 4.5 (OFF), map to HVAC "off"
-	if data.Mode == "manual" && data.Temperature <= 4.5 {
-		data.HVACMode = "off"
-	}
-
-	// Dynamic Wall Thermostat Detection (for 0x70 / 0x02)
-	// Protocol: If Payload Length >= 5, Bytes 3-4 are Actual Temperature
-	if len(payload) >= 5 {
-		// Formula: ((Byte3 & 0x01) << 8) | Byte4
-		// Divide by 10.0
-		byte3 := payload[3]
-		byte4 := payload[4]
-
-		rawTemp := int(byte3&0x01)<<8 | int(byte4)
-		actualTemp := float64(rawTemp) / 10.0
-
-		data.CurrentTemperature = &actualTemp
-	}
-
-	return data
 }
 
 func sendDiscovery(srcAddr string) {
@@ -829,26 +840,7 @@ func handleMQTTCommand(client mqtt.Client, msg mqtt.Message) {
 	log.Infof("Processing set temperature command: %.1f for %s", temp, srcAddr)
 
 	// Preserve current mode from state cache (default to Manual if unknown)
-	// Mode bits: 00=Auto, 01=Manual, 10=Vacation, 11=Boost
-	var modeBits byte = 0x01 // Default to Manual
-
-	stateMutex.RLock()
-	if existing, ok := stateCache[srcAddr]; ok {
-		switch existing.Mode {
-		case "auto":
-			modeBits = 0x00
-		case "manual":
-			modeBits = 0x01
-		case "vacation":
-			modeBits = 0x02
-		case "boost":
-			modeBits = 0x03
-		}
-		log.Debugf("Preserving current mode '%s' (0x%02X) for %s", existing.Mode, modeBits, srcAddr)
-	} else {
-		log.Warnf("No cached state for %s, defaulting to Manual mode", srcAddr)
-	}
-	stateMutex.RUnlock()
+	modeBits := getModeFromCache(srcAddr)
 
 	// Payload: (Temp * 2) | (Mode << 6)
 	// Protocol says: (Method 0x40) Formula: (TargetTemp * 2) + (ModeBits << 6).
@@ -912,22 +904,31 @@ func handleMQTTModeCommand(client mqtt.Client, msg mqtt.Message) {
 	sendCommand(srcAddr, 0x40, []byte{payloadByte}, fmt.Sprintf("Set Mode %s", mode))
 }
 
-// sendCommand constructs and sends a MAX! message via CUL
-func sendCommand(dstAddr string, typeByte byte, payload []byte, description string) {
-	// Increment Global Counter
+// nextMsgCounter increments and returns the global message counter (1-255, wrapping)
+func nextMsgCounter() int {
 	msgCounterMutex.Lock()
+	defer msgCounterMutex.Unlock()
 	msgCounter++
 	if msgCounter > 255 {
 		msgCounter = 1
 	}
-	cnt := msgCounter
-	msgCounterMutex.Unlock()
+	return msgCounter
+}
 
-	// Src Address (Cube ID)
+// getGatewayAddress returns the 3-byte gateway address from config
+// Falls back to default if config is invalid
+func getGatewayAddress() []byte {
 	srcBytes, _ := hex.DecodeString(config.GatewayID)
 	if len(srcBytes) != 3 {
-		srcBytes = []byte{0x12, 0x34, 0x56} // Fallback
+		return []byte{0x12, 0x34, 0x56} // Fallback
 	}
+	return srcBytes
+}
+
+// sendCommand constructs and sends a MAX! message via CUL
+func sendCommand(dstAddr string, typeByte byte, payload []byte, description string) {
+	cnt := nextMsgCounter()
+	srcBytes := getGatewayAddress()
 
 	// Dst Address
 	dstBytes, _ := hex.DecodeString(dstAddr)
@@ -982,23 +983,9 @@ func sendCommand(dstAddr string, typeByte byte, payload []byte, description stri
 
 func sendPairPong(targetAddr string) {
 	// PairPong: Type 0x01
-	// Structure: Len(1) | Cnt(1) | Type(1) | Src(3) | Dst(3) | Payload(1=0x00?)
 	// To send via CUL: "Zs" + HexString
-
-	// Increment Global Counter safely
-	msgCounterMutex.Lock()
-	msgCounter++
-	if msgCounter > 255 {
-		msgCounter = 1
-	}
-	cnt := msgCounter
-	msgCounterMutex.Unlock()
-
-	srcBytes, _ := hex.DecodeString(config.GatewayID)
-	if len(srcBytes) != 3 {
-		srcBytes = []byte{0x12, 0x34, 0x56} // Fallback default
-	}
-
+	cnt := nextMsgCounter()
+	srcBytes := getGatewayAddress()
 	dstBytes, _ := hex.DecodeString(targetAddr)
 
 	// Payload must be 5 bytes to hit Len 0x0E
@@ -1164,35 +1151,32 @@ func sendDisplayMode(dstAddr string, showActual bool) {
 
 // sendTimeBroadcast sends Type 0x03 TimeInformation to broadcast address 000000
 // All devices paired with this gateway will receive and accept this message.
-// Payload format (5 bytes):
-//   - Byte 0: Year (since 2000)
-//   - Byte 1: Day of month
-//   - Byte 2: Hour
-//   - Byte 3: Minute | ((Month & 0x0C) << 4)
-//   - Byte 4: Second | ((Month & 0x03) << 6)
 func sendTimeBroadcast() {
+	payload := buildTimePayload()
 	now := time.Now()
-	year := byte(now.Year() - 2000)
-	month := byte(now.Month())
-	day := byte(now.Day())
-	hour := byte(now.Hour())
-	min := byte(now.Minute())
-	sec := byte(now.Second())
-
-	compressedOne := min | ((month & 0x0C) << 4)
-	compressedTwo := sec | ((month & 0x03) << 6)
-
-	payload := []byte{year, day, hour, compressedOne, compressedTwo}
-
 	log.Infof("Broadcasting time sync: %d-%02d-%02d %02d:%02d:%02d",
-		now.Year(), month, day, hour, min, sec)
-
+		now.Year(), now.Month(), now.Day(), now.Hour(), now.Minute(), now.Second())
 	sendCommand("000000", 0x03, payload, "Time Broadcast")
 }
 
 // sendTimeToDevice sends Type 0x03 TimeInformation to a specific device address
 // This is used to respond to time requests from devices or to sync time after pairing
 func sendTimeToDevice(dstAddr string) {
+	payload := buildTimePayload()
+	now := time.Now()
+	log.Infof("Sending time to %s: %d-%02d-%02d %02d:%02d:%02d",
+		dstAddr, now.Year(), now.Month(), now.Day(), now.Hour(), now.Minute(), now.Second())
+	sendCommand(dstAddr, 0x03, payload, fmt.Sprintf("Time to %s", dstAddr))
+}
+
+// buildTimePayload constructs the 5-byte time payload for MAX! protocol
+// Payload format:
+//   - Byte 0: Year (since 2000)
+//   - Byte 1: Day of month
+//   - Byte 2: Hour
+//   - Byte 3: Minute | ((Month & 0x0C) << 4)
+//   - Byte 4: Second | ((Month & 0x03) << 6)
+func buildTimePayload() []byte {
 	now := time.Now()
 	year := byte(now.Year() - 2000)
 	month := byte(now.Month())
@@ -1204,16 +1188,45 @@ func sendTimeToDevice(dstAddr string) {
 	compressedOne := min | ((month & 0x0C) << 4)
 	compressedTwo := sec | ((month & 0x03) << 6)
 
-	payload := []byte{year, day, hour, compressedOne, compressedTwo}
+	return []byte{year, day, hour, compressedOne, compressedTwo}
+}
 
-	log.Infof("Sending time to %s: %d-%02d-%02d %02d:%02d:%02d",
-		dstAddr, now.Year(), month, day, hour, min, sec)
+// getModeFromCache retrieves the current mode bits for a device from state cache.
+// Returns 0x01 (Manual) as default if device state is not cached.
+func getModeFromCache(srcAddr string) byte {
+	stateMutex.RLock()
+	defer stateMutex.RUnlock()
 
-	sendCommand(dstAddr, 0x03, payload, fmt.Sprintf("Time to %s", dstAddr))
+	existing, ok := stateCache[srcAddr]
+	if !ok {
+		log.Warnf("No cached state for %s, defaulting to Manual mode", srcAddr)
+		return 0x01
+	}
+
+	modeBits := modeStringToBits(existing.Mode)
+	log.Debugf("Preserving current mode '%s' (0x%02X) for %s", existing.Mode, modeBits, srcAddr)
+	return modeBits
+}
+
+// modeStringToBits converts a mode string to MAX! protocol mode bits
+// Mode bits: 00=Auto, 01=Manual, 10=Vacation, 11=Boost
+func modeStringToBits(mode string) byte {
+	switch mode {
+	case "auto":
+		return 0x00
+	case "manual":
+		return 0x01
+	case "vacation":
+		return 0x02
+	case "boost":
+		return 0x03
+	default:
+		return 0x01 // Default to Manual
+	}
 }
 
 // startPeriodicTimeSync starts a goroutine that broadcasts time on startup
-// and then every 24 hours to keep all paired devices synchronized.
+// and then every 1 hour to keep all paired devices synchronized.
 func startPeriodicTimeSync() {
 	// Initial delay to allow serial connection to be established
 	time.Sleep(10 * time.Second)
@@ -1221,7 +1234,7 @@ func startPeriodicTimeSync() {
 	for {
 		log.Info("Sending periodic time broadcast")
 		sendTimeBroadcast()
-		time.Sleep(24 * time.Hour)
+		time.Sleep(1 * time.Hour)
 	}
 }
 

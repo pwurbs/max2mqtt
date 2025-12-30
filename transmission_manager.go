@@ -44,11 +44,14 @@ var txMgr *TransmissionManager
 // creditResponseRegex matches credit response format: "yy xxx" (e.g., "00 900", "01 850")
 var creditResponseRegex = regexp.MustCompile(`^\d+\s+\d+$`)
 
+// whitespaceRegex is precompiled for performance in sscanf
+var whitespaceRegex = regexp.MustCompile(`\s+`)
+
 func initTransmissionManager() {
 	// Parse Timeout
 	timeout, err := time.ParseDuration(config.CommandTimeout)
 	if err != nil {
-		log.Warnf("Invalid CommandTimeout '%s', defaulting to 2m", config.CommandTimeout)
+		log.Warnf("Invalid CommandTimeout '%s', defaulting to 1m", config.CommandTimeout)
 		timeout = 1 * time.Minute
 	}
 
@@ -113,91 +116,108 @@ func (t *TransmissionManager) Enqueue(devicedID, payload, description string) {
 	}
 }
 
+// maybeRestoreState restores state for non-broadcast devices.
+// Returns early if deviceID is the broadcast address.
+func (t *TransmissionManager) maybeRestoreState(deviceID string) {
+	if deviceID == "000000" {
+		return
+	}
+	t.restoreState(deviceID)
+}
+
+// drainChannel clears any pending signal from a channel without blocking.
+func drainChannel(ch <-chan struct{}) {
+	select {
+	case <-ch:
+	default:
+	}
+}
+
 // dispatcherLoop consumes queued commands and dispatches them.
-// Broadcasts (deviceID=000000) skip LOVF handling.
+// Broadcasts (deviceID=000000) skip state restoration.
 // We do NOT wait for ACKs—the next RX from the device will self-correct state if needed.
 func (t *TransmissionManager) dispatcherLoop() {
 	for cmd := range t.queue {
-		// Handle broadcast messages (000000) - no state restore needed
-		isBroadcast := cmd.DeviceID == "000000"
+		t.processCommand(cmd)
+	}
+}
 
-		// 1. Check Timeout before even querying
-		if time.Since(cmd.CreatedAt) > t.Timeout {
-			log.Warnf("Command to %s timed out (waited %s) due to duty cycle limits. Restoring state.", cmd.DeviceID, time.Since(cmd.CreatedAt))
-			if !isBroadcast {
-				t.restoreState(cmd.DeviceID)
-			}
-			continue
-		}
+// processCommand handles a single command dispatch attempt.
+func (t *TransmissionManager) processCommand(cmd QueuedCommand) {
+	// 1. Check Timeout before even querying
+	if time.Since(cmd.CreatedAt) > t.Timeout {
+		log.Warnf("Command to %s timed out (waited %s) due to duty cycle limits. Restoring state.", cmd.DeviceID, time.Since(cmd.CreatedAt))
+		t.maybeRestoreState(cmd.DeviceID)
+		return
+	}
 
-		// 2. Query credits before TX
-		log.Debug("TxMgr: Querying credits before TX (X)")
+	// 2. Query credits and wait for response
+	credits, queueLen, ok := t.queryCreditStatus()
+	if !ok {
+		t.maybeRestoreState(cmd.DeviceID)
+		return
+	}
 
-		// Clear any stale signal
-		select {
-		case <-t.creditResponse:
-		default:
-		}
+	// 3. Check conditions: queue == 0 AND credits >= minCredits
+	if queueLen != 0 {
+		log.Warnf("TxMgr: CUL queue busy (queue=%d). Cannot TX to %s. Restoring state.", queueLen, cmd.DeviceID)
+		t.maybeRestoreState(cmd.DeviceID)
+		return
+	}
 
-		// Send X command to query credits/queue
-		select {
-		case serialWrite <- "X":
-		default:
-			log.Warn("TxMgr: Could not send credit query (channel full)")
-			if !isBroadcast {
-				t.restoreState(cmd.DeviceID)
-			}
-			continue
-		}
+	if credits < t.MinCredits {
+		log.Warnf("TxMgr: Insufficient credits (%d < %d). Cannot TX to %s. Restoring state.", credits, t.MinCredits, cmd.DeviceID)
+		t.maybeRestoreState(cmd.DeviceID)
+		return
+	}
 
-		// 3. Wait for credit response with timeout
-		queryTimeout := 3 * time.Second
-		select {
-		case <-t.creditResponse:
-			// Response received, continue to check
-		case <-time.After(queryTimeout):
-			log.Warnf("TxMgr: Credit query timeout after %s. Restoring state for %s.", queryTimeout, cmd.DeviceID)
-			if !isBroadcast {
-				t.restoreState(cmd.DeviceID)
-			}
-			continue
-		}
+	// 4. Clear LOVF channel before TX and dispatch
+	drainChannel(t.lovfChan)
+	t.dispatchToSerial(cmd, credits, queueLen)
+}
 
-		// 4. Check conditions: queue == 0 AND credits >= minCredits
-		t.mutex.RLock()
-		credits := t.CurrentCredits
-		queueLen := t.QueueLength
-		t.mutex.RUnlock()
+// queryCreditStatus sends a credit query and waits for the response.
+// Returns (credits, queueLen, success).
+func (t *TransmissionManager) queryCreditStatus() (credits int, queueLen int, ok bool) {
+	log.Debug("TxMgr: Querying credits before TX (X)")
 
-		if queueLen != 0 {
-			log.Warnf("TxMgr: CUL queue busy (queue=%d). Cannot TX to %s. Restoring state.", queueLen, cmd.DeviceID)
-			if !isBroadcast {
-				t.restoreState(cmd.DeviceID)
-			}
-			continue
-		}
+	// Clear any stale signal
+	drainChannel(t.creditResponse)
 
-		if credits < t.MinCredits {
-			log.Warnf("TxMgr: Insufficient credits (%d < %d). Cannot TX to %s. Restoring state.", credits, t.MinCredits, cmd.DeviceID)
-			if !isBroadcast {
-				t.restoreState(cmd.DeviceID)
-			}
-			continue
-		}
+	// Send X command to query credits/queue
+	select {
+	case serialWrite <- "X":
+	default:
+		log.Warn("TxMgr: Could not send credit query (channel full)")
+		return 0, 0, false
+	}
 
-		// 5. Clear LOVF channel before TX
-		select {
-		case <-t.lovfChan:
-		default:
-		}
+	// Wait for credit response with timeout
+	const queryTimeout = 3 * time.Second
+	select {
+	case <-t.creditResponse:
+		// Response received
+	case <-time.After(queryTimeout):
+		log.Warnf("TxMgr: Credit query timeout after %s", queryTimeout)
+		return 0, 0, false
+	}
 
-		// 6. Dispatch the command
-		select {
-		case serialWrite <- cmd.Payload:
-			log.Infof("TxMgr: TX dispatched to %s: '%s' (Credits: %d, Queue: %d)", cmd.DeviceID, cmd.Description, credits, queueLen)
-		default:
-			log.Errorf("TxMgr: Serial write channel full! Dropping command for %s", cmd.DeviceID)
-		}
+	// Read current state
+	t.mutex.RLock()
+	credits = t.CurrentCredits
+	queueLen = t.QueueLength
+	t.mutex.RUnlock()
+
+	return credits, queueLen, true
+}
+
+// dispatchToSerial sends the command payload to the serial channel.
+func (t *TransmissionManager) dispatchToSerial(cmd QueuedCommand, credits, queueLen int) {
+	select {
+	case serialWrite <- cmd.Payload:
+		log.Infof("TxMgr: TX dispatched to %s: '%s' (Credits: %d, Queue: %d)", cmd.DeviceID, cmd.Description, credits, queueLen)
+	default:
+		log.Errorf("TxMgr: Serial write channel full! Dropping command for %s", cmd.DeviceID)
 	}
 }
 
@@ -223,8 +243,6 @@ func (t *TransmissionManager) restoreState(deviceID string) {
 	// Re-publish the existing clean state to MQTT
 	// This overwrites any optimistic UI changes in HA
 	log.Infof("TxMgr: Restoring state for %s: %s", deviceID, existing)
-	// We need to modify existing state slightly or just publish?
-	// If we just publish, HA receives the "old" values again and updates UI.
 	publishState(deviceID, existing)
 }
 
@@ -247,7 +265,7 @@ func ParseCreditResponse(text string) (queueLen int, credits int, matched bool) 
 
 // sscanf is a helper to parse two integers from a space-separated string
 func sscanf(text string, q *int, c *int) (int, error) {
-	parts := regexp.MustCompile(`\s+`).Split(text, -1)
+	parts := whitespaceRegex.Split(text, -1)
 	if len(parts) < 2 {
 		return 0, nil
 	}
