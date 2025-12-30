@@ -18,9 +18,12 @@ type QueuedCommand struct {
 }
 
 // TransmissionManager handles the complexity of sending commands to MAX! devices.
-// It effectively manages two distinct constraints:
-// 1. Regulatory Duty Cycle (via CUL Credits): Ensuring we don't exceed the 1% airtime limit.
-// 2. Reliable Delivery (via Handshaking): Ensuring commands are acknowledged by the device (ACK).
+// It manages the Regulatory Duty Cycle (via CUL Credits), ensuring we don't exceed
+// the 1% airtime limit. Commands are dispatched when credits are available.
+//
+// Note: We do NOT wait for ACKs. The MAX! system is self-correcting—the next RX
+// packet from a device will contain its actual state, automatically fixing any
+// discrepancy if a TX was lost.
 type TransmissionManager struct {
 	// Duty Cycle State
 	CurrentCredits int
@@ -32,16 +35,8 @@ type TransmissionManager struct {
 	queue          chan QueuedCommand
 	creditResponse chan struct{} // Signal when credit response received
 
-	// Pending TX tracking (per device)
-	pendingTX    map[string]bool
-	pendingMutex sync.RWMutex
-
 	// LOVF detection
 	lovfChan chan struct{}
-
-	// ACK notification channels (per device)
-	ackChans map[string]chan struct{}
-	ackMutex sync.Mutex
 }
 
 var txMgr *TransmissionManager
@@ -69,9 +64,7 @@ func initTransmissionManager() {
 		Timeout:        timeout,
 		queue:          make(chan QueuedCommand, 100),
 		creditResponse: make(chan struct{}, 1),
-		pendingTX:      make(map[string]bool),
 		lovfChan:       make(chan struct{}, 1),
-		ackChans:       make(map[string]chan struct{}),
 	}
 
 	log.Infof("TransmissionManager initialized. MinCredits: %d, Timeout: %s", minCredits, timeout)
@@ -121,11 +114,11 @@ func (t *TransmissionManager) Enqueue(devicedID, payload, description string) {
 }
 
 // dispatcherLoop consumes queued commands and dispatches them.
-// ACK waiting is handled in separate goroutines to allow parallel TX to different devices.
-// Broadcasts (deviceID=000000) skip ACK handling entirely.
+// Broadcasts (deviceID=000000) skip LOVF handling.
+// We do NOT wait for ACKs—the next RX from the device will self-correct state if needed.
 func (t *TransmissionManager) dispatcherLoop() {
 	for cmd := range t.queue {
-		// Handle broadcast messages (000000) - no ACK expected
+		// Handle broadcast messages (000000) - no state restore needed
 		isBroadcast := cmd.DeviceID == "000000"
 
 		// 1. Check Timeout before even querying
@@ -137,14 +130,7 @@ func (t *TransmissionManager) dispatcherLoop() {
 			continue
 		}
 
-		// 2. Check if device already has a pending TX - reject if busy (skip for broadcasts)
-		if !isBroadcast && t.IsPendingTX(cmd.DeviceID) {
-			log.Warnf("TxMgr: Device %s busy (awaiting ACK). Rejecting command '%s'. Restoring state.", cmd.DeviceID, cmd.Description)
-			t.restoreState(cmd.DeviceID)
-			continue
-		}
-
-		// 3. Query credits before TX
+		// 2. Query credits before TX
 		log.Debug("TxMgr: Querying credits before TX (X)")
 
 		// Clear any stale signal
@@ -158,22 +144,26 @@ func (t *TransmissionManager) dispatcherLoop() {
 		case serialWrite <- "X":
 		default:
 			log.Warn("TxMgr: Could not send credit query (channel full)")
-			t.restoreState(cmd.DeviceID)
+			if !isBroadcast {
+				t.restoreState(cmd.DeviceID)
+			}
 			continue
 		}
 
-		// 4. Wait for credit response with timeout
+		// 3. Wait for credit response with timeout
 		queryTimeout := 3 * time.Second
 		select {
 		case <-t.creditResponse:
 			// Response received, continue to check
 		case <-time.After(queryTimeout):
 			log.Warnf("TxMgr: Credit query timeout after %s. Restoring state for %s.", queryTimeout, cmd.DeviceID)
-			t.restoreState(cmd.DeviceID)
+			if !isBroadcast {
+				t.restoreState(cmd.DeviceID)
+			}
 			continue
 		}
 
-		// 5. Check conditions: queue == 0 AND credits >= minCredits
+		// 4. Check conditions: queue == 0 AND credits >= minCredits
 		t.mutex.RLock()
 		credits := t.CurrentCredits
 		queueLen := t.QueueLength
@@ -181,87 +171,34 @@ func (t *TransmissionManager) dispatcherLoop() {
 
 		if queueLen != 0 {
 			log.Warnf("TxMgr: CUL queue busy (queue=%d). Cannot TX to %s. Restoring state.", queueLen, cmd.DeviceID)
-			t.restoreState(cmd.DeviceID)
+			if !isBroadcast {
+				t.restoreState(cmd.DeviceID)
+			}
 			continue
 		}
 
 		if credits < t.MinCredits {
 			log.Warnf("TxMgr: Insufficient credits (%d < %d). Cannot TX to %s. Restoring state.", credits, t.MinCredits, cmd.DeviceID)
-			t.restoreState(cmd.DeviceID)
+			if !isBroadcast {
+				t.restoreState(cmd.DeviceID)
+			}
 			continue
 		}
 
-		// 6. Clear LOVF channel before TX
+		// 5. Clear LOVF channel before TX
 		select {
 		case <-t.lovfChan:
 		default:
 		}
 
-		// 7. All conditions met - dispatch the command
-		if isBroadcast {
-			// Broadcasts: send directly, no ACK handling
-			select {
-			case serialWrite <- cmd.Payload:
-				log.Infof("TxMgr: Broadcast dispatched: '%s' (Credits: %d, Queue: %d)", cmd.Description, credits, queueLen)
-			default:
-				log.Error("TxMgr: Serial write channel full! Dropping broadcast")
-			}
-			continue
-		}
-
-		// Regular commands: mark device as busy and wait for ACK
-		t.SetPendingTX(cmd.DeviceID)
-
-		// Create ACK channel BEFORE sending to prevent race condition where ACK arrives
-		// before we start waiting. The channel is buffered (size 1) so it will hold the signal.
-		t.getOrCreateAckChan(cmd.DeviceID)
-
+		// 6. Dispatch the command
 		select {
 		case serialWrite <- cmd.Payload:
-			log.Infof("TxMgr: TX dispatched to %s: '%s' (Credits: %d, Queue: %d). Waiting for ACK...", cmd.DeviceID, cmd.Description, credits, queueLen)
-			// Spawn goroutine to wait for ACK - dispatcher continues immediately
-			go t.handleAckWait(cmd)
+			log.Infof("TxMgr: TX dispatched to %s: '%s' (Credits: %d, Queue: %d)", cmd.DeviceID, cmd.Description, credits, queueLen)
 		default:
 			log.Errorf("TxMgr: Serial write channel full! Dropping command for %s", cmd.DeviceID)
-			t.ClearPendingTX(cmd.DeviceID)
-			continue
 		}
 	}
-}
-
-// handleAckWait waits for ACK in a separate goroutine, allowing the dispatcher to continue.
-func (t *TransmissionManager) handleAckWait(cmd QueuedCommand) {
-	defer t.ClearPendingTX(cmd.DeviceID)
-
-	ackReceived := t.waitForAckOrError(cmd.DeviceID)
-
-	if !ackReceived {
-		log.Warnf("TxMgr: No ACK from %s within timeout for command '%s'. Restoring state.", cmd.DeviceID, cmd.Description)
-		t.restoreState(cmd.DeviceID)
-	} else {
-		log.Infof("TxMgr: ACK received from %s. Command confirmed: %s", cmd.DeviceID, cmd.Description)
-	}
-}
-
-// IsPendingTX checks if a device is currently awaiting ACK
-func (t *TransmissionManager) IsPendingTX(deviceID string) bool {
-	t.pendingMutex.RLock()
-	defer t.pendingMutex.RUnlock()
-	return t.pendingTX[deviceID]
-}
-
-// SetPendingTX marks a device as awaiting ACK
-func (t *TransmissionManager) SetPendingTX(deviceID string) {
-	t.pendingMutex.Lock()
-	defer t.pendingMutex.Unlock()
-	t.pendingTX[deviceID] = true
-}
-
-// ClearPendingTX marks a device as no longer awaiting ACK
-func (t *TransmissionManager) ClearPendingTX(deviceID string) {
-	t.pendingMutex.Lock()
-	defer t.pendingMutex.Unlock()
-	delete(t.pendingTX, deviceID)
 }
 
 // SignalLOVF signals that a LOVF (Limit Of Voice Full) response was received
@@ -271,59 +208,6 @@ func (t *TransmissionManager) SignalLOVF() {
 	default:
 		// Channel already has a signal, don't block
 	}
-}
-
-// NotifyAck notifies that an ACK was received from a specific device
-func (t *TransmissionManager) NotifyAck(deviceID string) {
-	t.ackMutex.Lock()
-	ch, exists := t.ackChans[deviceID]
-	t.ackMutex.Unlock()
-
-	if exists {
-		select {
-		case ch <- struct{}{}:
-		default:
-			// Channel already has a signal
-		}
-	}
-}
-
-// waitForAckOrError waits for the specific device to acknowledge the command.
-// It returns true if ACK received, false if timed out or LOVF occurred.
-func (t *TransmissionManager) waitForAckOrError(deviceID string) bool {
-	ackChan := t.getOrCreateAckChan(deviceID)
-	defer t.removeAckChan(deviceID)
-
-	select {
-	case <-ackChan:
-		return true
-	case <-t.lovfChan:
-		log.Warn("TxMgr: LOVF received during TX wait")
-		return false
-	case <-time.After(t.Timeout):
-		return false
-	}
-}
-
-// getOrCreateAckChan gets or creates an ACK channel for a device
-func (t *TransmissionManager) getOrCreateAckChan(deviceID string) chan struct{} {
-	t.ackMutex.Lock()
-	defer t.ackMutex.Unlock()
-
-	if ch, exists := t.ackChans[deviceID]; exists {
-		return ch
-	}
-
-	ch := make(chan struct{}, 1)
-	t.ackChans[deviceID] = ch
-	return ch
-}
-
-// removeAckChan removes the ACK channel for a device
-func (t *TransmissionManager) removeAckChan(deviceID string) {
-	t.ackMutex.Lock()
-	defer t.ackMutex.Unlock()
-	delete(t.ackChans, deviceID)
 }
 
 func (t *TransmissionManager) restoreState(deviceID string) {
