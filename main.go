@@ -484,7 +484,10 @@ func updateDeviceState(srcAddr string, newData *MaxDeviceData) {
 	stateMutex.Lock()
 	existing, exists := stateCache[srcAddr]
 	if !exists {
-		existing = &MaxDeviceData{}
+		existing = &MaxDeviceData{
+			Mode:     "manual",
+			HVACMode: "heat",
+		}
 		stateCache[srcAddr] = existing
 	}
 
@@ -533,13 +536,13 @@ func updateDeviceState(srcAddr string, newData *MaxDeviceData) {
 }
 
 type MaxDeviceData struct {
-	Temperature        float64  `json:"temperature,omitempty"`
-	CurrentTemperature *float64 `json:"current_temperature,omitempty"`
+	Temperature        float64  `json:"temperature"`
+	CurrentTemperature *float64 `json:"current_temperature"`
 
-	Mode       string `json:"mode,omitempty"`
-	HVACMode   string `json:"hvac_mode,omitempty"`
-	HVACAction string `json:"hvac_action,omitempty"`
-	Battery    string `json:"battery,omitempty"`
+	Mode       string `json:"mode"`
+	HVACMode   string `json:"hvac_mode"`
+	HVACAction string `json:"hvac_action"`
+	Battery    string `json:"battery"`
 }
 
 // convert pointer to string for appropriate logging
@@ -700,9 +703,9 @@ func sendDiscovery(srcAddr string) {
 		"temperature_state_topic":      fmt.Sprintf(TopicFormatState, srcAddr),
 		"temperature_state_template":   "{{ value_json.temperature }}",
 		"current_temperature_topic":    fmt.Sprintf(TopicFormatState, srcAddr),
-		"current_temperature_template": "{{ value_json.current_temperature }}",
+		"current_temperature_template": "{{ value_json.get('current_temperature') }}",
 		"mode_state_topic":             fmt.Sprintf(TopicFormatState, srcAddr),
-		"mode_state_template":          "{{ value_json.hvac_mode }}",
+		"mode_state_template":          "{{ value_json.get('hvac_mode', 'heat') }}",
 		"mode_command_topic":           fmt.Sprintf("max/%s/mode/set", srcAddr),
 		"modes":                        []string{"auto", "heat", "off"},
 		"min_temp":                     5,
@@ -711,7 +714,7 @@ func sendDiscovery(srcAddr string) {
 		"precision":                    0.1,
 		"temperature_unit":             "C",
 		"action_topic":                 fmt.Sprintf(TopicFormatState, srcAddr),
-		"action_template":              "{{ value_json.hvac_action }}",
+		"action_template":              "{{ value_json.get('hvac_action') }}",
 		"device":                       deviceInfo,
 	}
 
@@ -728,7 +731,7 @@ func sendDiscovery(srcAddr string) {
 		"device_class": "battery", // For binary_sensor: On=Low, Off=Normal
 		"state_topic":  fmt.Sprintf(TopicFormatState, srcAddr),
 		// Template: Return ON (Low) or OFF (Normal)
-		"value_template": "{{ 'ON' if value_json.battery == 'low' else 'OFF' }}",
+		"value_template": "{{ 'ON' if value_json.get('battery') == 'low' else 'OFF' }}",
 		"device":         deviceInfo,
 	}
 	bytes, _ = json.Marshal(battPayload)

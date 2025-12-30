@@ -26,6 +26,7 @@ Designed to replace legacy FHEM installations with a lightweight, standalone ser
         -   **Binary Sensor**: Battery status (OK/Low).
     -   **Pairing Mode**: Trigger via MQTT (`max/bridge/pair`) to pair new devices.
     -   **Retained Messages**: All MQTT messages (discovery and state) are published with the `retain` flag. This ensures Home Assistant keeps entities and their last known values across bridge or HA restarts.
+    -   **Default State**: Newly discovered devices without explicit mode information default to `heat` mode to avoid "Invalid mode" errors in Home Assistant.
 -   **Duty Cycle Management**: 
     -   Adheres to 868MHz 1% transmission limits using CUL's credit system.
     -   Before each TX: queries CUL credits and queue status (`X` command).
@@ -252,6 +253,15 @@ CGO_ENABLED=0 GOOS=linux GOARCH=arm GOARM=7 go build -ldflags="-w -s" -o max2mqt
   - **Smart Filtering**: Processes key packet types for state updates.
 - **Duty Cycle**: Pre-TX credit and queue check via 'X' command. TX blocked if queue busy or credits insufficient.
 - **TX Flow**: Fire-and-forget after credit check. Handles LOVF errors. Self-correcting via future RX packets.
+
+## Troubleshooting
+
+### "Invalid modes mode" Warning in Home Assistant
+
+If you see warnings like `Invalid modes mode: ` in Home Assistant logs:
+1. This occurs when a device is discovered via a packet that doesn't contain mode information (e.g., a simple button press or wall thermostat control packet).
+2. The bridge now initializes such devices with a default mode of `heat` (Manual) to prevent this error.
+3. If the warning persists, restart the bridge to ensure the new default templates are applied to Home Assistant via MQTT discovery.
 
 ## TX Flow
 
