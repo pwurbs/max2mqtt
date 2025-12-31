@@ -215,6 +215,9 @@ Or via **Home Assistant Developer Tools → Services → MQTT: Publish**:
 
 > **Note**: If you omit the partner type (e.g., just `0D3E4F`), it defaults to type 1 (radiator thermostat).
 
+## Configuration
+### Watchdog and restart
+There is no watchdog endpoint configured in the addon nor there is a healtcheck configured in Dockerfile. So, we only rely on the containers Exited state, which signals that the main process (PID 1) of the container has died. If you want to automatically restart the addonin such case, then activate the Watchdog button on the Addon information page.
 
 ## Development
 
@@ -262,6 +265,8 @@ If you see warnings like `Invalid modes mode: ` in Home Assistant logs:
 1. This occurs when a device is discovered via a packet that doesn't contain mode information (e.g., a simple button press or wall thermostat control packet).
 2. The bridge now initializes such devices with a default mode of `heat` (Manual) to prevent this error.
 3. If the warning persists, restart the bridge to ensure the new default templates are applied to Home Assistant via MQTT discovery.
+
+This means that after restarting the addon in HA, the mode of the device will be set to `heat` (Manual). When you want to have the Auto mode back, then you need to change the mode in Home Assistant.
 
 ## TX Flow
 
