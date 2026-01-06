@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"regexp"
 	"strconv"
 	"sync"
@@ -70,7 +71,7 @@ func initTransmissionManager() {
 		lovfChan:       make(chan struct{}, 1),
 	}
 
-	log.Infof("TransmissionManager initialized. MinCredits: %d, Timeout: %s", minCredits, timeout)
+	fmt.Printf("time=\"%s\" level=info msg=\"TransmissionManager initialized. MinCredits: %d, Timeout: %s\"\n", time.Now().Format(time.RFC3339), minCredits, timeout)
 
 	go txMgr.dispatcherLoop()
 }

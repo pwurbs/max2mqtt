@@ -105,7 +105,7 @@ func main() {
 	loadConfig()
 	setupLogging()
 
-	log.Info("Starting MAX! to MQTT Bridge")
+	fmt.Printf("time=\"%s\" level=info msg=\"Starting MAX! to MQTT Bridge\"\n", time.Now().Format(time.RFC3339))
 
 	// 1.5. Duty Cycle
 	initTransmissionManager()
@@ -131,7 +131,7 @@ func main() {
 		case msg := <-serialChan:
 			handleSerialMessage(msg)
 		case <-sigChan:
-			log.Info("Shutting down...")
+			log.Warn("Shutting down...")
 			return
 		}
 	}
@@ -211,7 +211,7 @@ func setupLogging() {
 	}
 	log.SetLevel(lvl)
 	log.SetFormatter(&log.TextFormatter{FullTimestamp: true})
-	log.Infof("Log level set to: %s", lvl)
+	fmt.Printf("time=\"%s\" level=info msg=\"Log level set to: %s\"\n", time.Now().Format(time.RFC3339), lvl)
 }
 
 func setupMQTT() {
