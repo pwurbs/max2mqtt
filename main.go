@@ -28,9 +28,10 @@ type Config struct {
 	LogLevel   string `json:"log_level"`
 	GatewayID  string `json:"gateway_id"`
 
-	// Duty Cycle Config
+	// Transmission Manager Config
 	DutyCycleMinCredits int    `json:"duty_cycle_min_credits"`
 	CommandTimeout      string `json:"command_timeout"`
+	MaxCulQueue         int    `json:"max_cul_queue"`
 }
 
 // Global state
@@ -147,6 +148,7 @@ func loadConfig() {
 		GatewayID:           "123456",
 		DutyCycleMinCredits: 100,
 		CommandTimeout:      "1m",
+		MaxCulQueue:         5,
 	}
 
 	// Try loading from options.json (Standard HA Add-on location)

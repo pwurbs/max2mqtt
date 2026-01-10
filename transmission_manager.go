@@ -28,8 +28,9 @@ type QueuedCommand struct {
 type TransmissionManager struct {
 	// Duty Cycle State
 	CurrentCredits int
-	QueueLength    int // CUL's internal send queue (0 = empty, ready to TX)
+	QueueLength    int // Current buffering level reported by CUL (Real-time hardware state)
 	MinCredits     int
+	MaxQueue       int // Configured limit for concurrent commands (Software throttle)
 	Timeout        time.Duration
 
 	mutex          sync.RWMutex
@@ -56,22 +57,19 @@ func initTransmissionManager() {
 		timeout = 1 * time.Minute
 	}
 
-	minCredits := config.DutyCycleMinCredits
-	if minCredits <= 0 {
-		minCredits = 100 // Safe default
-	}
-
 	txMgr = &TransmissionManager{
 		CurrentCredits: 0, // Start pessimistic - will query before first TX
 		QueueLength:    0,
-		MinCredits:     minCredits,
+		MinCredits:     config.DutyCycleMinCredits,
+		MaxQueue:       config.MaxCulQueue,
 		Timeout:        timeout,
 		queue:          make(chan QueuedCommand, 100),
 		creditResponse: make(chan struct{}, 1),
 		lovfChan:       make(chan struct{}, 1),
 	}
 
-	fmt.Printf("time=\"%s\" level=info msg=\"TransmissionManager initialized. MinCredits: %d, Timeout: %s\"\n", time.Now().Format(time.RFC3339), minCredits, timeout)
+	fmt.Printf("time=\"%s\" level=info msg=\"TransmissionManager initialized. MinCredits: %d, MaxQueue: %d, Timeout: %s\"\n",
+		time.Now().Format(time.RFC3339), config.DutyCycleMinCredits, config.MaxCulQueue, timeout)
 
 	go txMgr.dispatcherLoop()
 }
@@ -159,9 +157,9 @@ func (t *TransmissionManager) processCommand(cmd QueuedCommand) {
 		return
 	}
 
-	// 3. Check conditions: queue == 0 AND credits >= minCredits
-	if queueLen != 0 {
-		log.Warnf("TxMgr: CUL queue busy (queue=%d). Cannot TX to %s. Restoring state.", queueLen, cmd.DeviceID)
+	// 3. Check conditions: usage of CUL queue allowed up to MaxQueue
+	if queueLen >= t.MaxQueue {
+		log.Warnf("TxMgr: CUL queue too busy (queue=%d >= limit=%d). Cannot TX to %s. Restoring state.", queueLen, t.MaxQueue, cmd.DeviceID)
 		t.maybeRestoreState(cmd.DeviceID)
 		return
 	}

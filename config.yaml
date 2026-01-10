@@ -18,6 +18,7 @@ options:
   gateway_id: "123456"
   duty_cycle_min_credits: 200
   command_timeout: "1m"
+  max_cul_queue: 5
 schema:
   serial_port: str
   baud_rate: int
@@ -28,6 +29,7 @@ schema:
   gateway_id: str
   duty_cycle_min_credits: int
   command_timeout: str
+  max_cul_queue: int
 devices:
   - "/dev/ttyACM0"
   - "/dev/ttyACM1"
