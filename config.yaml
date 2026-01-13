@@ -19,6 +19,7 @@ options:
   duty_cycle_min_credits: 200
   command_timeout: "1m"
   max_cul_queue: 5
+  tx_check_period: "1m"
 schema:
   serial_port: str
   baud_rate: int
@@ -30,6 +31,7 @@ schema:
   duty_cycle_min_credits: int
   command_timeout: str
   max_cul_queue: int
+  tx_check_period: str
 devices:
   - "/dev/ttyACM0"
   - "/dev/ttyACM1"

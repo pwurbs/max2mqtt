@@ -32,6 +32,7 @@ type Config struct {
 	DutyCycleMinCredits int    `json:"duty_cycle_min_credits"`
 	CommandTimeout      string `json:"command_timeout"`
 	MaxCulQueue         int    `json:"max_cul_queue"`
+	TxCheckPeriod       string `json:"tx_check_period"`
 }
 
 // Global state
@@ -149,6 +150,7 @@ func loadConfig() {
 		DutyCycleMinCredits: 100,
 		CommandTimeout:      "1m",
 		MaxCulQueue:         5,
+		TxCheckPeriod:       "1m",
 	}
 
 	// Try loading from options.json (Standard HA Add-on location)
@@ -172,36 +174,31 @@ func loadConfigFromFile() {
 }
 
 // loadEnvOverrides applies environment variable overrides to config
+// loadEnvOverrides applies environment variable overrides to config
 func loadEnvOverrides() {
-	if v := os.Getenv("SERIAL_PORT"); v != "" {
-		config.SerialPort = v
+	loadEnvString("SERIAL_PORT", &config.SerialPort)
+	loadEnvInt("DUTY_CYCLE_MIN_CREDITS", &config.DutyCycleMinCredits)
+	loadEnvString("COMMAND_TIMEOUT", &config.CommandTimeout)
+	loadEnvInt("MAX_CUL_QUEUE", &config.MaxCulQueue)
+	loadEnvString("TX_CHECK_PERIOD", &config.TxCheckPeriod)
+	loadEnvString("MQTT_BROKER", &config.MQTTBroker)
+	loadEnvString("MQTT_USER", &config.MQTTUser)
+	loadEnvString("MQTT_PASS", &config.MQTTPass)
+	loadEnvString("GATEWAY_ID", &config.GatewayID)
+	loadEnvString("LOG_LEVEL", &config.LogLevel)
+	loadEnvInt("BAUD_RATE", &config.BaudRate)
+}
+
+func loadEnvString(key string, target *string) {
+	if v := os.Getenv(key); v != "" {
+		*target = v
 	}
-	if v := os.Getenv("DUTY_CYCLE_MIN_CREDITS"); v != "" {
+}
+
+func loadEnvInt(key string, target *int) {
+	if v := os.Getenv(key); v != "" {
 		if val, err := strconv.Atoi(v); err == nil {
-			config.DutyCycleMinCredits = val
-		}
-	}
-	if v := os.Getenv("COMMAND_TIMEOUT"); v != "" {
-		config.CommandTimeout = v
-	}
-	if v := os.Getenv("MQTT_BROKER"); v != "" {
-		config.MQTTBroker = v
-	}
-	if v := os.Getenv("MQTT_USER"); v != "" {
-		config.MQTTUser = v
-	}
-	if v := os.Getenv("MQTT_PASS"); v != "" {
-		config.MQTTPass = v
-	}
-	if v := os.Getenv("GATEWAY_ID"); v != "" {
-		config.GatewayID = v
-	}
-	if v := os.Getenv("LOG_LEVEL"); v != "" {
-		config.LogLevel = v
-	}
-	if v := os.Getenv("BAUD_RATE"); v != "" {
-		if rate, err := strconv.Atoi(v); err == nil {
-			config.BaudRate = rate
+			*target = val
 		}
 	}
 }
@@ -509,6 +506,11 @@ func updateDeviceState(srcAddr string, newData *MaxDeviceData) {
 	}
 	if newData.Battery != "" {
 		existing.Battery = newData.Battery
+	}
+
+	// Check for pending verification
+	if existing.Temperature > 0 && verificationMgr != nil {
+		verificationMgr.CheckVerification(srcAddr, existing.Temperature)
 	}
 
 	// Calculate HVAC Action based on User Rule:
@@ -853,6 +855,14 @@ func handleMQTTCommand(client mqtt.Client, msg mqtt.Message) {
 	payloadByte := tempVal | (modeBits << 6)
 
 	sendCommand(srcAddr, 0x40, []byte{payloadByte}, fmt.Sprintf("Set Temp %.1f", temp))
+
+	// Start Verification
+	if verificationMgr != nil {
+		verificationMgr.AddVerification(srcAddr, temp, func() {
+			log.Warnf("Retrying Set Temp %.1f for %s", temp, srcAddr)
+			sendCommand(srcAddr, 0x40, []byte{payloadByte}, fmt.Sprintf("Retry Set Temp %.1f", temp))
+		})
+	}
 }
 
 func handleMQTTPair(client mqtt.Client, msg mqtt.Message) {
@@ -907,6 +917,7 @@ func handleMQTTModeCommand(client mqtt.Client, msg mqtt.Message) {
 	payloadByte := tempVal | (modeBits << 6)
 
 	sendCommand(srcAddr, 0x40, []byte{payloadByte}, fmt.Sprintf("Set Mode %s", mode))
+
 }
 
 // nextMsgCounter increments and returns the global message counter (1-255, wrapping)

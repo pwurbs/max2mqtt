@@ -72,6 +72,7 @@ func initTransmissionManager() {
 		time.Now().Format(time.RFC3339), config.DutyCycleMinCredits, config.MaxCulQueue, timeout)
 
 	go txMgr.dispatcherLoop()
+	initVerificationManager()
 }
 
 func (t *TransmissionManager) Start() {
@@ -282,4 +283,107 @@ func sscanf(text string, q *int, c *int) (int, error) {
 	*c = cVal
 
 	return 2, nil
+}
+
+// -----------------------------------------------------------------------------------
+// Verification Manager Logic
+// -----------------------------------------------------------------------------------
+
+// VerificationEntry tracks a pending verification
+type VerificationEntry struct {
+	TargetTemp float64
+	Timer      *time.Timer
+	ResendFunc func()
+}
+
+// VerificationManager manages pending command verifications
+type VerificationManager struct {
+	mutex         sync.Mutex
+	verifications map[string]*VerificationEntry // Key: DeviceID
+	timeout       time.Duration
+}
+
+var verificationMgr *VerificationManager
+
+// initVerificationManager initializes the global verification manager
+func initVerificationManager() {
+	timeoutDuration, err := time.ParseDuration(config.TxCheckPeriod)
+	if err != nil {
+		log.Warnf("Invalid TxCheckPeriod '%s', defaulting to 1m", config.TxCheckPeriod)
+		timeoutDuration = 1 * time.Minute
+	}
+
+	verificationMgr = &VerificationManager{
+		verifications: make(map[string]*VerificationEntry),
+		timeout:       timeoutDuration,
+	}
+	log.Infof("VerificationManager initialized with period: %s", timeoutDuration)
+}
+
+// AddVerification starts tracking a verification for a device
+// resendFunc is a closure that will be executed if verification fails
+func (vm *VerificationManager) AddVerification(deviceID string, targetTemp float64, resendFunc func()) {
+	vm.mutex.Lock()
+	defer vm.mutex.Unlock()
+
+	// Stop existing timer if any (last write wins)
+	if entry, exists := vm.verifications[deviceID]; exists {
+		entry.Timer.Stop()
+	}
+
+	log.Infof("Verification started for %s: Expecting %.1f within %s", deviceID, targetTemp, vm.timeout)
+
+	// Create new entry with timer
+	timer := time.AfterFunc(vm.timeout, func() {
+		vm.handleTimeout(deviceID, targetTemp)
+	})
+
+	vm.verifications[deviceID] = &VerificationEntry{
+		TargetTemp: targetTemp,
+		Timer:      timer,
+		ResendFunc: resendFunc,
+	}
+}
+
+// CheckVerification checks if the received actualTemp matches the pending verification
+func (vm *VerificationManager) CheckVerification(deviceID string, actualTemp float64) {
+	vm.mutex.Lock()
+	defer vm.mutex.Unlock()
+
+	entry, exists := vm.verifications[deviceID]
+	if !exists {
+		return
+	}
+
+	if actualTemp == entry.TargetTemp {
+		log.Infof("Verification successful for %s: %.1f confirmed.", deviceID, actualTemp)
+		entry.Timer.Stop()
+		delete(vm.verifications, deviceID)
+	} else {
+		// Mismatch - we just wait for timeout OR subsequent update
+		log.Debugf("Verification mismatch for %s: Wanted %.1f, Got %.1f. Waiting...", deviceID, entry.TargetTemp, actualTemp)
+	}
+}
+
+// handleTimeout is called when the verification timer expires
+func (vm *VerificationManager) handleTimeout(deviceID string, targetTemp float64) {
+	vm.mutex.Lock()
+	// Check if entry still exists and matches expected temp (handle race conditions)
+	entry, exists := vm.verifications[deviceID]
+	if !exists || entry.TargetTemp != targetTemp {
+		vm.mutex.Unlock()
+		return
+	}
+	// Remove the failed verification
+	delete(vm.verifications, deviceID)
+	// Extract resend func to call outside lock
+	resendFunc := entry.ResendFunc
+	vm.mutex.Unlock()
+
+	log.Warnf("Verification failed for %s: Did not receive confirmation of %.1f. Resending...", deviceID, targetTemp)
+
+	// Execute resend
+	if resendFunc != nil {
+		resendFunc()
+	}
 }
