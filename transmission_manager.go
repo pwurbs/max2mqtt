@@ -2,12 +2,11 @@ package main
 
 import (
 	"fmt"
+	"log/slog"
 	"regexp"
 	"strconv"
 	"sync"
 	"time"
-
-	log "github.com/sirupsen/logrus"
 )
 
 // QueuedCommand represents a TX command waiting in the local queue
@@ -53,7 +52,7 @@ func initTransmissionManager() {
 	// Parse Timeout
 	timeout, err := time.ParseDuration(config.CommandTimeout)
 	if err != nil {
-		log.Warnf("Invalid CommandTimeout '%s', defaulting to 1m", config.CommandTimeout)
+		slog.Warn("Invalid CommandTimeout, defaulting to 1m", "value", config.CommandTimeout)
 		timeout = 1 * time.Minute
 	}
 
@@ -85,7 +84,7 @@ func (t *TransmissionManager) UpdateCredits(credits, queueLen int) {
 	t.CurrentCredits = credits
 	t.QueueLength = queueLen
 	t.mutex.Unlock()
-	log.Debugf("TxMgr: Updated - Credits: %d, Queue: %d", credits, queueLen)
+	slog.Debug("TxMgr: Updated", "credits", credits, "queue", queueLen)
 }
 
 // SignalCreditResponse notifies the dispatcher that a credit report "yy xxx" has been received.
@@ -109,10 +108,11 @@ func (t *TransmissionManager) Enqueue(devicedID, payload, description string) {
 	}
 
 	select {
+
 	case t.queue <- cmd:
-		log.Debugf("TxMgr: Enqueued command for %s: %s", devicedID, description)
+		slog.Debug("TxMgr: Enqueued command", "device", devicedID, "desc", description)
 	default:
-		log.Warnf("TxMgr: Queue full! Dropping command for %s", devicedID)
+		slog.Warn("TxMgr: Queue full! Dropping command", "device", devicedID)
 	}
 }
 
@@ -146,7 +146,7 @@ func (t *TransmissionManager) dispatcherLoop() {
 func (t *TransmissionManager) processCommand(cmd QueuedCommand) {
 	// 1. Check Timeout before even querying
 	if time.Since(cmd.CreatedAt) > t.Timeout {
-		log.Warnf("Command to %s timed out (waited %s) due to duty cycle limits. Restoring state.", cmd.DeviceID, time.Since(cmd.CreatedAt))
+		slog.Warn("Command timed out due to duty cycle limits. Restoring state.", "device", cmd.DeviceID, "wait", time.Since(cmd.CreatedAt))
 		t.maybeRestoreState(cmd.DeviceID)
 		return
 	}
@@ -159,14 +159,15 @@ func (t *TransmissionManager) processCommand(cmd QueuedCommand) {
 	}
 
 	// 3. Check conditions: usage of CUL queue allowed up to MaxQueue
+	// 3. Check conditions: usage of CUL queue allowed up to MaxQueue
 	if queueLen >= t.MaxQueue {
-		log.Warnf("TxMgr: CUL queue too busy (queue=%d >= limit=%d). Cannot TX to %s. Restoring state.", queueLen, t.MaxQueue, cmd.DeviceID)
+		slog.Warn("TxMgr: CUL queue too busy. Restoring state.", "queue", queueLen, "limit", t.MaxQueue, "device", cmd.DeviceID)
 		t.maybeRestoreState(cmd.DeviceID)
 		return
 	}
 
 	if credits < t.MinCredits {
-		log.Warnf("TxMgr: Insufficient credits (%d < %d). Cannot TX to %s. Restoring state.", credits, t.MinCredits, cmd.DeviceID)
+		slog.Warn("TxMgr: Insufficient credits. Restoring state.", "credits", credits, "min", t.MinCredits, "device", cmd.DeviceID)
 		t.maybeRestoreState(cmd.DeviceID)
 		return
 	}
@@ -179,7 +180,7 @@ func (t *TransmissionManager) processCommand(cmd QueuedCommand) {
 // queryCreditStatus sends a credit query and waits for the response.
 // Returns (credits, queueLen, success).
 func (t *TransmissionManager) queryCreditStatus() (credits int, queueLen int, ok bool) {
-	log.Debug("TxMgr: Querying credits before TX (X)")
+	slog.Debug("TxMgr: Querying credits before TX (X)")
 
 	// Clear any stale signal
 	drainChannel(t.creditResponse)
@@ -188,7 +189,7 @@ func (t *TransmissionManager) queryCreditStatus() (credits int, queueLen int, ok
 	select {
 	case serialWrite <- "X":
 	default:
-		log.Warn("TxMgr: Could not send credit query (channel full)")
+		slog.Warn("TxMgr: Could not send credit query (channel full)")
 		return 0, 0, false
 	}
 
@@ -198,7 +199,7 @@ func (t *TransmissionManager) queryCreditStatus() (credits int, queueLen int, ok
 	case <-t.creditResponse:
 		// Response received
 	case <-time.After(queryTimeout):
-		log.Warnf("TxMgr: Credit query timeout after %s", queryTimeout)
+		slog.Warn("TxMgr: Credit query timeout", "timeout", queryTimeout)
 		return 0, 0, false
 	}
 
@@ -214,10 +215,11 @@ func (t *TransmissionManager) queryCreditStatus() (credits int, queueLen int, ok
 // dispatchToSerial sends the command payload to the serial channel.
 func (t *TransmissionManager) dispatchToSerial(cmd QueuedCommand, credits, queueLen int) {
 	select {
+
 	case serialWrite <- cmd.Payload:
-		log.Infof("TxMgr: TX dispatched to %s: '%s' (Credits: %d, Queue: %d)", cmd.DeviceID, cmd.Description, credits, queueLen)
+		slog.Info("TxMgr: TX dispatched", "device", cmd.DeviceID, "desc", cmd.Description, "credits", credits, "queue", queueLen)
 	default:
-		log.Errorf("TxMgr: Serial write channel full! Dropping command for %s", cmd.DeviceID)
+		slog.Error("TxMgr: Serial write channel full! Dropping command", "device", cmd.DeviceID)
 	}
 }
 
@@ -236,13 +238,13 @@ func (t *TransmissionManager) restoreState(deviceID string) {
 	stateMutex.RUnlock()
 
 	if !ok {
-		log.Warnf("TxMgr: No state known for %s to restore.", deviceID)
+		slog.Warn("TxMgr: No state known to restore.", "device", deviceID)
 		return
 	}
 
 	// Re-publish the existing clean state to MQTT
 	// This overwrites any optimistic UI changes in HA
-	log.Infof("TxMgr: Restoring state for %s: %s", deviceID, existing)
+	slog.Info("TxMgr: Restoring state", "device", deviceID, "state", existing)
 	publishState(deviceID, existing)
 }
 
@@ -309,7 +311,7 @@ var verificationMgr *VerificationManager
 func initVerificationManager() {
 	timeoutDuration, err := time.ParseDuration(config.TxCheckPeriod)
 	if err != nil {
-		log.Warnf("Invalid TxCheckPeriod '%s', defaulting to 1m", config.TxCheckPeriod)
+		slog.Warn("Invalid TxCheckPeriod, defaulting to 1m", "value", config.TxCheckPeriod)
 		timeoutDuration = 1 * time.Minute
 	}
 
@@ -317,7 +319,7 @@ func initVerificationManager() {
 		verifications: make(map[string]*VerificationEntry),
 		timeout:       timeoutDuration,
 	}
-	log.Infof("VerificationManager initialized with period: %s", timeoutDuration)
+	slog.Info("VerificationManager initialized", "period", timeoutDuration)
 }
 
 // AddVerification starts tracking a verification for a device
@@ -331,7 +333,7 @@ func (vm *VerificationManager) AddVerification(deviceID string, targetTemp float
 		entry.Timer.Stop()
 	}
 
-	log.Infof("Verification started for %s: Expecting %.1f within %s", deviceID, targetTemp, vm.timeout)
+	slog.Info("Verification started", "device", deviceID, "target", targetTemp, "timeout", vm.timeout)
 
 	// Create new entry with timer
 	timer := time.AfterFunc(vm.timeout, func() {
@@ -356,12 +358,12 @@ func (vm *VerificationManager) CheckVerification(deviceID string, actualTemp flo
 	}
 
 	if actualTemp == entry.TargetTemp {
-		log.Infof("Verification successful for %s: %.1f confirmed.", deviceID, actualTemp)
+		slog.Info("Verification successful", "device", deviceID, "temp", actualTemp)
 		entry.Timer.Stop()
 		delete(vm.verifications, deviceID)
 	} else {
 		// Mismatch - we just wait for timeout OR subsequent update
-		log.Debugf("Verification mismatch for %s: Wanted %.1f, Got %.1f. Waiting...", deviceID, entry.TargetTemp, actualTemp)
+		slog.Debug("Verification mismatch. Waiting...", "device", deviceID, "wanted", entry.TargetTemp, "got", actualTemp)
 	}
 }
 
@@ -380,7 +382,7 @@ func (vm *VerificationManager) handleTimeout(deviceID string, targetTemp float64
 	resendFunc := entry.ResendFunc
 	vm.mutex.Unlock()
 
-	log.Warnf("Verification failed for %s: Did not receive confirmation of %.1f. Resending...", deviceID, targetTemp)
+	slog.Warn("Verification failed: Did not receive confirmation. Resending...", "device", deviceID, "expected", targetTemp)
 
 	// Execute resend
 	if resendFunc != nil {

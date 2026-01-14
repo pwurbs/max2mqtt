@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/signal"
 	"strconv"
@@ -14,7 +15,6 @@ import (
 	"time"
 
 	mqtt "github.com/eclipse/paho.mqtt.golang"
-	log "github.com/sirupsen/logrus"
 	"go.bug.st/serial"
 )
 
@@ -100,6 +100,7 @@ func getDeviceConfig(deviceAddr string) *DeviceConfig {
 const (
 	MaxMsgStart      = 'Z'
 	TopicFormatState = "max/%s/state"
+	HexTypeFormat    = "0x%02X"
 )
 
 func main() {
@@ -133,7 +134,7 @@ func main() {
 		case msg := <-serialChan:
 			handleSerialMessage(msg)
 		case <-sigChan:
-			log.Warn("Shutting down...")
+			slog.Warn("Shutting down...")
 			return
 		}
 	}
@@ -169,7 +170,7 @@ func loadConfigFromFile() {
 	if err != nil {
 		return
 	}
-	log.Info("Loading config from /data/options.json")
+	slog.Info("Loading config from /data/options.json")
 	_ = json.Unmarshal(data, &config)
 }
 
@@ -204,12 +205,26 @@ func loadEnvInt(key string, target *int) {
 }
 
 func setupLogging() {
-	lvl, err := log.ParseLevel(config.LogLevel)
-	if err != nil {
-		lvl = log.InfoLevel
+	var lvl slog.Level
+	switch strings.ToLower(config.LogLevel) {
+	case "debug":
+		lvl = slog.LevelDebug
+	case "info":
+		lvl = slog.LevelInfo
+	case "warn", "warning":
+		lvl = slog.LevelWarn
+	case "error":
+		lvl = slog.LevelError
+	default:
+		lvl = slog.LevelInfo
 	}
-	log.SetLevel(lvl)
-	log.SetFormatter(&log.TextFormatter{FullTimestamp: true})
+
+	opts := &slog.HandlerOptions{
+		Level: lvl,
+	}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, opts))
+	slog.SetDefault(logger)
+
 	fmt.Printf("time=\"%s\" level=info msg=\"Log level set to: %s\"\n", time.Now().Format(time.RFC3339), lvl)
 }
 
@@ -223,7 +238,7 @@ func setupMQTT() {
 	opts.SetClientID("max2mqtt_bridge")
 	opts.SetAutoReconnect(true)
 	opts.SetOnConnectHandler(func(c mqtt.Client) {
-		log.Info("Connected to MQTT Broker")
+		slog.Info("Connected to MQTT Broker")
 		// Subscribe to set commands
 		c.Subscribe("max/+/set", 0, handleMQTTCommand)
 		c.Subscribe("max/+/mode/set", 0, handleMQTTModeCommand)
@@ -237,7 +252,7 @@ func setupMQTT() {
 
 	mqttClient = mqtt.NewClient(opts)
 	if token := mqttClient.Connect(); token.Wait() && token.Error() != nil {
-		log.Warn("Could not connect to MQTT initially, will retry in background: ", token.Error())
+		slog.Warn("Could not connect to MQTT initially, will retry in background", "error", token.Error())
 	}
 }
 
@@ -263,7 +278,7 @@ func serialReaderLoop(out chan<- string, in <-chan string) {
 		}
 
 		close(stopWriter)
-		log.Warn("Serial connection lost or closed. Reconnecting...")
+		slog.Warn("Serial connection lost or closed. Reconnecting...")
 		port.Close()
 		time.Sleep(2 * time.Second)
 	}
@@ -280,10 +295,10 @@ func openSerialPort() serial.Port {
 	}
 	port, err := serial.Open(config.SerialPort, mode)
 	if err != nil {
-		log.Errorf("Failed to open serial port %s: %v. Retrying in 5s...", config.SerialPort, err)
+		slog.Error("Failed to open serial port", "port", config.SerialPort, "error", err)
 		return nil
 	}
-	log.Infof("Opened serial port %s", config.SerialPort)
+	slog.Info("Opened serial port", "port", config.SerialPort)
 	return port
 }
 
@@ -301,9 +316,9 @@ func initializeCUL(port serial.Port) {
 	// X   = Query Credits
 	initCmds := []string{"V", "Zr", "X"}
 	for _, cmd := range initCmds {
-		log.Infof("Sending Init Command: %s", cmd)
+		slog.Info("Sending Init Command", "command", cmd)
 		if _, err := port.Write([]byte(cmd + "\r")); err != nil {
-			log.Errorf("Failed to send init command %s: %v", cmd, err)
+			slog.Error("Failed to send init command", "command", cmd, "error", err)
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
@@ -314,9 +329,9 @@ func startSerialWriter(port serial.Port, in <-chan string, stopWriter <-chan str
 	for {
 		select {
 		case cmd := <-in:
-			log.Debugf("TX: %s", cmd)
+			slog.Debug("TX", "command", cmd)
 			if _, err := port.Write([]byte(cmd + "\r")); err != nil {
-				log.Errorf("Failed to write to serial: %v", err)
+				slog.Error("Failed to write to serial", "error", err)
 				return
 			}
 		case <-stopWriter:
@@ -327,7 +342,7 @@ func startSerialWriter(port serial.Port, in <-chan string, stopWriter <-chan str
 
 // processSerialLine handles a single line received from the serial port
 func processSerialLine(text string, out chan<- string) {
-	log.Debugf("RX: %s", text)
+	slog.Debug("RX", "text", text)
 
 	if strings.HasPrefix(text, string(MaxMsgStart)) {
 		out <- text
@@ -335,7 +350,7 @@ func processSerialLine(text string, out chan<- string) {
 	}
 
 	if text == "LOVF" {
-		log.Warn("CUL: LOVF (Limit Of Voice Full) - TX buffer overflow")
+		slog.Warn("CUL: LOVF (Limit Of Voice Full) - TX buffer overflow")
 		if txMgr != nil {
 			txMgr.SignalLOVF()
 		}
@@ -416,19 +431,19 @@ func handleSerialMessage(raw string) {
 	raw = strings.TrimSpace(raw)
 	pkt, err := parseMaxMessage(raw)
 	if err != nil {
-		log.Debugf("Failed to parse message '%s': %v", raw, err)
+		slog.Debug("Failed to parse message", "raw", raw, "error", err)
 		return
 	}
 
-	log.Infof("Parsed Packet from %s (Type 0x%02X): %X", pkt.SrcAddr, pkt.Type, pkt.Payload)
+	slog.Info("Parsed Packet", "src", pkt.SrcAddr, "type", fmt.Sprintf(HexTypeFormat, pkt.Type), "payload", fmt.Sprintf("%X", pkt.Payload))
 
 	// Check if this is a PairPing (Type 0x00) and we are in pairing mode
 	if pkt.Type == 0x00 {
 		if time.Now().Before(pairingUntil) {
-			log.Infof("Received PairPing from %s while in pairing mode. Sending PairPong...", pkt.SrcAddr)
+			slog.Info("Received PairPing from while in pairing mode. Sending PairPong...", "src", pkt.SrcAddr)
 			sendPairPong(pkt.SrcAddr)
 		} else {
-			log.Debugf("Received PairPing from %s but pairing mode is not active.", pkt.SrcAddr)
+			slog.Debug("Received PairPing but pairing mode is not active.", "src", pkt.SrcAddr)
 		}
 		return
 	}
@@ -436,7 +451,7 @@ func handleSerialMessage(raw string) {
 	// Check if this is a TimeInformation request (Type 0x03)
 	// Devices send this to request current time from the gateway
 	if pkt.Type == 0x03 {
-		log.Infof("Received TimeInformation request from %s, sending time...", pkt.SrcAddr)
+		slog.Info("Received TimeInformation request, sending time...", "src", pkt.SrcAddr)
 		sendTimeToDevice(pkt.SrcAddr)
 		return
 	}
@@ -461,7 +476,7 @@ func handleSerialMessage(raw string) {
 	isValidAck := pkt.Type == 0x02 && len(pkt.Payload) >= 4
 
 	if !isValidType && !isValidAck {
-		log.Infof("Ignored message from device %s (Type 0x%02X, PayloadLen %d) - Not a valid state packet", pkt.SrcAddr, pkt.Type, len(pkt.Payload))
+		slog.Info("Ignored message from device", "str", pkt.SrcAddr, "type", fmt.Sprintf(HexTypeFormat, pkt.Type), "payload_len", len(pkt.Payload))
 		// Explicitly ignored:
 		// - 0x30 (Shutter Contact)
 		// - 0x02 (Short Ack < 4 bytes)
@@ -535,7 +550,7 @@ func updateDeviceState(srcAddr string, newData *MaxDeviceData) {
 	}
 	stateMutex.Unlock()
 
-	log.Infof("Decoded Data for %s: %s", srcAddr, &dataToPublish)
+	slog.Info("Decoded Data", "src", srcAddr, "data", &dataToPublish)
 	publishState(srcAddr, &dataToPublish)
 }
 
@@ -806,21 +821,21 @@ func publishState(srcAddr string, data *MaxDeviceData) {
 
 	payload, err := json.Marshal(data)
 	if err != nil {
-		log.Errorf("Failed to marshal state for %s: %v", deviceID, err)
+		slog.Error("Failed to marshal state", "device", deviceID, "error", err)
 		return
 	}
 
 	// Enhanced Logging to show Entity Mapping
-	log.Debugf("MQTT PUB %s (Broadcast to all entities):", topic)
-	log.Debugf("  -> Climate (Temp): %.1f", data.Temperature)
+	slog.Debug("MQTT PUB (Broadcast to all entities)", "topic", topic)
+	slog.Debug("  -> Climate (Temp)", "temp", data.Temperature)
 	if data.CurrentTemperature != nil {
-		log.Debugf("  -> Climate (CurTemp): %.1f", *data.CurrentTemperature)
+		slog.Debug("  -> Climate (CurTemp)", "cur_temp", *data.CurrentTemperature)
 	}
-	log.Debugf("  -> Climate (HVAC): %s", data.HVACMode)
-	log.Debugf("  -> Internal Mode: %s", data.Mode)
+	slog.Debug("  -> Climate (HVAC)", "hvac", data.HVACMode)
+	slog.Debug("  -> Internal Mode", "mode", data.Mode)
 
-	log.Debugf("  -> Binary (Battery): %s", data.Battery)
-	log.Debugf("  Raw Payload: %s", string(payload))
+	slog.Debug("  -> Binary (Battery)", "battery", data.Battery)
+	slog.Debug("  Raw Payload", "payload", string(payload))
 
 	token := mqttClient.Publish(topic, 0, true, payload) // Changed to retained=true
 	token.Wait()
@@ -836,15 +851,15 @@ func handleMQTTCommand(client mqtt.Client, msg mqtt.Message) {
 	srcAddr := topicParts[1]
 	payloadStr := string(msg.Payload())
 
-	log.Infof("Received command for %s: %s", srcAddr, payloadStr)
+	slog.Info("Received command", "src", srcAddr, "payload", payloadStr)
 
 	temp, err := strconv.ParseFloat(payloadStr, 64)
 	if err != nil {
-		log.Error("Invalid temperature format")
+		slog.Error("Invalid temperature format")
 		return
 	}
 
-	log.Infof("Processing set temperature command: %.1f for %s", temp, srcAddr)
+	slog.Info("Processing set temperature command", "temp", temp, "src", srcAddr)
 
 	// Preserve current mode from state cache (default to Manual if unknown)
 	modeBits := getModeFromCache(srcAddr)
@@ -859,14 +874,14 @@ func handleMQTTCommand(client mqtt.Client, msg mqtt.Message) {
 	// Start Verification
 	if verificationMgr != nil {
 		verificationMgr.AddVerification(srcAddr, temp, func() {
-			log.Warnf("Retrying Set Temp %.1f for %s", temp, srcAddr)
+			slog.Warn("Retrying Set Temp", "temp", temp, "src", srcAddr)
 			sendCommand(srcAddr, 0x40, []byte{payloadByte}, fmt.Sprintf("Retry Set Temp %.1f", temp))
 		})
 	}
 }
 
 func handleMQTTPair(client mqtt.Client, msg mqtt.Message) {
-	log.Info("Activating Pairing Mode for 60 seconds")
+	slog.Info("Activating Pairing Mode for 60 seconds")
 	pairingUntil = time.Now().Add(60 * time.Second)
 }
 
@@ -880,7 +895,7 @@ func handleMQTTModeCommand(client mqtt.Client, msg mqtt.Message) {
 	srcAddr := topicParts[1]
 	mode := string(msg.Payload())
 
-	log.Infof("Received mode command for %s: %s", srcAddr, mode)
+	slog.Info("Received mode command", "src", srcAddr, "mode", mode)
 
 	// Determine Mode Bits and Target Temp
 	var modeBits byte
@@ -890,7 +905,7 @@ func handleMQTTModeCommand(client mqtt.Client, msg mqtt.Message) {
 	stateMutex.RLock()
 	if existing, ok := stateCache[srcAddr]; ok && existing.Temperature > 0 {
 		targetTemp = existing.Temperature
-		log.Debugf("Preserving current temperature %.1f for mode change to %s", targetTemp, mode)
+		slog.Debug("Preserving current temperature for mode change", "temp", targetTemp, "mode", mode)
 	}
 	stateMutex.RUnlock()
 
@@ -909,7 +924,7 @@ func handleMQTTModeCommand(client mqtt.Client, msg mqtt.Message) {
 		modeBits = 0x03
 		targetTemp = 30.0 // Usually ignored for boost but safe max
 	default:
-		log.Warnf("Unknown mode %s", mode)
+		slog.Warn("Unknown mode", "mode", mode)
 		return
 	}
 
@@ -949,7 +964,7 @@ func sendCommand(dstAddr string, typeByte byte, payload []byte, description stri
 	// Dst Address
 	dstBytes, _ := hex.DecodeString(dstAddr)
 	if len(dstBytes) != 3 {
-		log.Errorf("Invalid destination address: %s", dstAddr)
+		slog.Error("Invalid destination address", "addr", dstAddr)
 		return
 	}
 
@@ -990,9 +1005,9 @@ func sendCommand(dstAddr string, typeByte byte, payload []byte, description stri
 		// Fallback if not init (should not happen)
 		select {
 		case serialWrite <- cmd:
-			log.Infof("TX -> %s: %s [%s]", dstAddr, description, hexStr)
+			slog.Info("TX", "dst", dstAddr, "desc", description, "hex", hexStr)
 		default:
-			log.Error("Serial write queue full")
+			slog.Error("Serial write queue full")
 		}
 	}
 }
@@ -1025,15 +1040,15 @@ func sendPairPong(targetAddr string) {
 
 	select {
 	case serialWrite <- cmd:
-		log.Infof("Sent PairPong to %s (Cnt: %d)", targetAddr, cnt)
+		slog.Info("Sent PairPong", "target", targetAddr, "cnt", cnt)
 		// Schedule time sync for newly paired device (direct, not broadcast)
-		log.Infof("Scheduling time sync for newly paired device %s", targetAddr)
+		slog.Info("Scheduling time sync for newly paired device", "target", targetAddr)
 		go func() {
 			time.Sleep(2 * time.Second)
 			sendTimeToDevice(targetAddr)
 		}()
 	default:
-		log.Error("Serial write queue full")
+		slog.Error("Serial write queue full")
 	}
 }
 
@@ -1050,17 +1065,17 @@ func handleMQTTEcoTemp(client mqtt.Client, msg mqtt.Message) {
 
 	temp, err := strconv.ParseFloat(payloadStr, 64)
 	if err != nil {
-		log.Errorf("Invalid eco temperature format: %s", payloadStr)
+		slog.Error("Invalid eco temperature format", "payload", payloadStr)
 		return
 	}
 
 	// Validate range (4.5 - 30.5)
 	if temp < 4.5 || temp > 30.5 {
-		log.Errorf("Eco temperature out of range (4.5-30.5): %.1f", temp)
+		slog.Error("Eco temperature out of range (4.5-30.5)", "temp", temp)
 		return
 	}
 
-	log.Infof("Setting eco temperature for %s: %.1f", srcAddr, temp)
+	slog.Info("Setting eco temperature", "src", srcAddr, "temp", temp)
 
 	// Update cached config
 	cfg := getDeviceConfig(srcAddr)
@@ -1085,17 +1100,17 @@ func handleMQTTComfortTemp(client mqtt.Client, msg mqtt.Message) {
 
 	temp, err := strconv.ParseFloat(payloadStr, 64)
 	if err != nil {
-		log.Errorf("Invalid comfort temperature format: %s", payloadStr)
+		slog.Error("Invalid comfort temperature format", "payload", payloadStr)
 		return
 	}
 
 	// Validate range (4.5 - 30.5)
 	if temp < 4.5 || temp > 30.5 {
-		log.Errorf("Comfort temperature out of range (4.5-30.5): %.1f", temp)
+		slog.Error("Comfort temperature out of range (4.5-30.5)", "temp", temp)
 		return
 	}
 
-	log.Infof("Setting comfort temperature for %s: %.1f", srcAddr, temp)
+	slog.Info("Setting comfort temperature", "src", srcAddr, "temp", temp)
 
 	// Update cached config
 	cfg := getDeviceConfig(srcAddr)
@@ -1120,7 +1135,7 @@ func handleMQTTDisplayMode(client mqtt.Client, msg mqtt.Message) {
 	payload := string(msg.Payload())
 
 	showActual := strings.EqualFold(payload, "Actual")
-	log.Infof("Setting display mode for %s: %s (showActual=%v)", srcAddr, payload, showActual)
+	slog.Info("Setting display mode", "src", srcAddr, "mode", payload, "showActual", showActual)
 
 	sendDisplayMode(srcAddr, showActual)
 }
@@ -1170,8 +1185,8 @@ func sendDisplayMode(dstAddr string, showActual bool) {
 func sendTimeBroadcast() {
 	payload := buildTimePayload()
 	now := time.Now()
-	log.Infof("Broadcasting time sync: %d-%02d-%02d %02d:%02d:%02d",
-		now.Year(), now.Month(), now.Day(), now.Hour(), now.Minute(), now.Second())
+	slog.Info("Broadcasting time sync", "time", fmt.Sprintf("%d-%02d-%02d %02d:%02d:%02d",
+		now.Year(), now.Month(), now.Day(), now.Hour(), now.Minute(), now.Second()))
 	sendCommand("000000", 0x03, payload, "Time Broadcast")
 }
 
@@ -1180,8 +1195,9 @@ func sendTimeBroadcast() {
 func sendTimeToDevice(dstAddr string) {
 	payload := buildTimePayload()
 	now := time.Now()
-	log.Infof("Sending time to %s: %d-%02d-%02d %02d:%02d:%02d",
-		dstAddr, now.Year(), now.Month(), now.Day(), now.Hour(), now.Minute(), now.Second())
+
+	slog.Info("Sending time to device", "src", dstAddr, "time", fmt.Sprintf("%d-%02d-%02d %02d:%02d:%02d",
+		now.Year(), now.Month(), now.Day(), now.Hour(), now.Minute(), now.Second()))
 	sendCommand(dstAddr, 0x03, payload, fmt.Sprintf("Time to %s", dstAddr))
 }
 
@@ -1215,13 +1231,13 @@ func getModeFromCache(srcAddr string) byte {
 
 	existing, ok := stateCache[srcAddr]
 	if !ok {
-		log.Warnf("No cached state for %s, defaulting to Manual mode", srcAddr)
+		slog.Warn("No cached state, defaulting to Manual mode", "src", srcAddr)
 		return 0x01
 	}
 
 	modeBits := modeStringToBits(existing.Mode)
-	log.Debugf("Preserving current mode '%s' (0x%02X) for %s", existing.Mode, modeBits, srcAddr)
 	return modeBits
+
 }
 
 // modeStringToBits converts a mode string to MAX! protocol mode bits
@@ -1248,7 +1264,7 @@ func startPeriodicTimeSync() {
 	time.Sleep(10 * time.Second)
 
 	for {
-		log.Info("Sending periodic time broadcast")
+		slog.Info("Sending periodic time broadcast")
 		sendTimeBroadcast()
 		time.Sleep(1 * time.Hour)
 	}
@@ -1276,7 +1292,7 @@ func handleMQTTAssociate(client mqtt.Client, msg mqtt.Message) {
 
 	// Validate source device address (6 hex chars)
 	if len(srcDevice) != 6 {
-		log.Errorf("Invalid source device address: %s (must be 6 hex characters)", srcDevice)
+		slog.Error("Invalid source device address (must be 6 hex chars)", "src", srcDevice)
 		return
 	}
 
@@ -1287,13 +1303,13 @@ func handleMQTTAssociate(client mqtt.Client, msg mqtt.Message) {
 	if strings.Contains(payload, ":") {
 		parts := strings.Split(payload, ":")
 		if len(parts) != 2 {
-			log.Errorf("Invalid associate payload format: %s (expected 'device_id' or 'device_id:type')", payload)
+			slog.Error("Invalid associate payload format (expected 'device_id' or 'device_id:type')", "payload", payload)
 			return
 		}
 		partnerDevice = strings.TrimSpace(parts[0])
 		typeVal, err := strconv.Atoi(strings.TrimSpace(parts[1]))
 		if err != nil || typeVal < 1 || typeVal > 5 {
-			log.Errorf("Invalid partner type: %s (must be 1-5)", parts[1])
+			slog.Error("Invalid partner type (must be 1-5)", "type", parts[1])
 			return
 		}
 		partnerType = byte(typeVal)
@@ -1303,15 +1319,13 @@ func handleMQTTAssociate(client mqtt.Client, msg mqtt.Message) {
 
 	// Validate partner device address
 	if len(partnerDevice) != 6 {
-		log.Errorf("Invalid partner device address: %s (must be 6 hex characters)", partnerDevice)
+		slog.Error("Invalid partner device address (must be 6 hex chars)", "partner", partnerDevice)
 		return
 	}
 
 	// Convert to uppercase for consistency
 	srcDevice = strings.ToUpper(srcDevice)
 	partnerDevice = strings.ToUpper(partnerDevice)
-
-	log.Infof("Associating device %s with partner %s (type %d)", srcDevice, partnerDevice, partnerType)
 
 	sendAddLinkPartner(srcDevice, partnerDevice, partnerType)
 }
@@ -1331,7 +1345,7 @@ func handleMQTTAssociate(client mqtt.Client, msg mqtt.Message) {
 func sendAddLinkPartner(srcDevice, partnerDevice string, partnerType byte) {
 	partnerBytes, err := hex.DecodeString(partnerDevice)
 	if err != nil || len(partnerBytes) != 3 {
-		log.Errorf("Invalid partner device address: %s", partnerDevice)
+		slog.Error("Invalid partner device address", "partner", partnerDevice)
 		return
 	}
 

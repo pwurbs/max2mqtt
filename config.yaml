@@ -1,7 +1,7 @@
 name: "MAX! to MQTT Bridge"
 version: "1.1.0"
 slug: "max2mqtt"
-description: "Bridge for MAX! Wall Thermostats via CUL-Stick to MQTT in Home Assistant"
+description: "Bridge for MAX! Thermostats via CUL-Stick to MQTT in Home Assistant"
 arch:
   - aarch64
   - amd64
