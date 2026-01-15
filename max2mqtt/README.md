@@ -10,7 +10,7 @@ But the current solutions to integrate MAX! components into Home Assistant are n
 
 Additionally, I was curious to see if I could use AI to help me with the development of this bridge.
 
-This add-on is a lightweight Go-based bridge connecting a CUL-USB stick (868MHz MAX! protocol) to Home Assistant via MQTT. It focusses on usage of an existing MAX! installation with wall thermostats and radiator valves, only supporting the really required functions to be used with Home Assistant. It's not intended as a full replacement of MAX! Cube or the implementation contained in FHEM. 
+This add-on is a lightweight Go-based bridge connecting a CUL-USB stick (868MHz MAX! protocol) to Home Assistant via MQTT. It focuses on usage of an existing MAX! installation with wall thermostats and radiator valves, only supporting the really required functions to be used with Home Assistant. It's not intended as a full replacement of MAX! Cube or the implementation contained in FHEM. 
 
 ## Features
 
