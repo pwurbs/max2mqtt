@@ -36,8 +36,6 @@ type TransmissionManager struct {
 	queue          chan QueuedCommand
 	creditResponse chan struct{} // Signal when credit response received
 
-	// LOVF detection
-	lovfChan chan struct{}
 }
 
 var txMgr *TransmissionManager
@@ -64,7 +62,6 @@ func initTransmissionManager() {
 		Timeout:        timeout,
 		queue:          make(chan QueuedCommand, 100),
 		creditResponse: make(chan struct{}, 1),
-		lovfChan:       make(chan struct{}, 1),
 	}
 
 	fmt.Printf("time=\"%s\" level=info msg=\"TransmissionManager initialized. MinCredits: %d, MaxQueue: %d, Timeout: %s\"\n",
@@ -172,8 +169,6 @@ func (t *TransmissionManager) processCommand(cmd QueuedCommand) {
 		return
 	}
 
-	// 4. Clear LOVF channel before TX and dispatch
-	drainChannel(t.lovfChan)
 	t.dispatchToSerial(cmd, credits, queueLen)
 }
 
@@ -220,15 +215,6 @@ func (t *TransmissionManager) dispatchToSerial(cmd QueuedCommand, credits, queue
 		slog.Info("TxMgr: TX dispatched", "device", cmd.DeviceID, "desc", cmd.Description, "credits", credits, "queue", queueLen)
 	default:
 		slog.Error("TxMgr: Serial write channel full! Dropping command", "device", cmd.DeviceID)
-	}
-}
-
-// SignalLOVF signals that a LOVF (Limit Of Voice Full) response was received
-func (t *TransmissionManager) SignalLOVF() {
-	select {
-	case t.lovfChan <- struct{}{}:
-	default:
-		// Channel already has a signal, don't block
 	}
 }
 

@@ -148,7 +148,7 @@ func loadConfig() {
 		MQTTBroker:          "tcp://homeassistant:1883",
 		LogLevel:            "info",
 		GatewayID:           "123456",
-		DutyCycleMinCredits: 100,
+		DutyCycleMinCredits: 200,
 		CommandTimeout:      "1m",
 		MaxCulQueue:         5,
 		TxCheckPeriod:       "1m",
@@ -350,10 +350,7 @@ func processSerialLine(text string, out chan<- string) {
 	}
 
 	if text == "LOVF" {
-		slog.Warn("CUL: LOVF (Limit Of Voice Full) - TX buffer overflow")
-		if txMgr != nil {
-			txMgr.SignalLOVF()
-		}
+		slog.Warn("CUL: LOVF (Limit Of Voice Full) - TX buffer overflow. Recommendation: Increase duty_cycle_min_credits")
 		return
 	}
 

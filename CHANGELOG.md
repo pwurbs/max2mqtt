@@ -3,7 +3,7 @@
 - Managing the duty cycle
 - Improved RX packet management
 - Now managing radiator thermostats too
-- Improved TX handshaking
+- Added TX validation
 
 ## 1.0.0
 
