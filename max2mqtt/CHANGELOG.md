@@ -1,6 +1,6 @@
-## Unreleased
+## 1.2.0
 
-- Enable culfw auto-Ack (`Za<gateway_id>`): the CUL acknowledges messages sent to the gateway, so window contacts and other devices no longer repeat them (longer battery life). The CUL's own Acks are ignored.
+- Enable culfw auto-Ack (`Za<gateway_id>`)
 
 ## 1.1.0
 
