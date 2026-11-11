@@ -313,8 +313,11 @@ func initializeCUL(port serial.Port) {
 	// Send Initialization Commands
 	// V   = Version Check (Tests comms)
 	// Zr  = Enable MAX! Sniffer Mode (Critical)
+	// Za  = Auto-Ack: the CUL itself acknowledges messages sent to our gateway address,
+	//       like the MAX! Cube does (same as FHEM CUL_MAX). Without it, window contacts and
+	//       other devices repeat their message and waste battery.
 	// X   = Query Credits
-	initCmds := []string{"V", "Zr", "X"}
+	initCmds := []string{"V", "Zr", "Za" + gatewayAddrHex(), "X"}
 	for _, cmd := range initCmds {
 		slog.Info("Sending Init Command", "command", cmd)
 		if _, err := port.Write([]byte(cmd + "\r")); err != nil {
@@ -429,6 +432,13 @@ func handleSerialMessage(raw string) {
 	pkt, err := parseMaxMessage(raw)
 	if err != nil {
 		slog.Debug("Failed to parse message", "raw", raw, "error", err)
+		return
+	}
+
+	// The CUL reports every Ack it sends on its own (auto-Ack, see initializeCUL).
+	// These come from our own gateway address and carry no device state: skip them.
+	if pkt.Type == 0x02 && pkt.SrcAddr == gatewayAddrHex() {
+		slog.Debug("Ignored own auto-Ack", "dst", pkt.DstAddr)
 		return
 	}
 
@@ -951,6 +961,12 @@ func getGatewayAddress() []byte {
 		return []byte{0x12, 0x34, 0x56} // Fallback
 	}
 	return srcBytes
+}
+
+// gatewayAddrHex returns the gateway address as 6 uppercase hex digits,
+// the same format as SrcAddr/DstAddr of a parsed packet
+func gatewayAddrHex() string {
+	return fmt.Sprintf("%06X", getGatewayAddress())
 }
 
 // sendCommand constructs and sends a MAX! message via CUL

@@ -8,6 +8,22 @@ The bridge automatically syncs time (Type `0x03`) with devices:
 -   On device request: responds when a device sends a TimeInformation request
 -   Every 1 hour: broadcasts to all devices to keep clocks accurate
 
+## Auto-Ack (longer battery life)
+
+MAX! devices expect an Ack from their gateway (the Cube, or FHEM) for some messages. Without an Ack, a device repeats the message several times and then sets its "rf error" flag. This costs battery and airtime.
+
+On start, the bridge therefore sends `Za<gateway_id>` to the CUL (as FHEM does). From then on, culfw answers these messages by itself, within milliseconds:
+
+-   window contacts (ShutterContactState, `0x30`)
+-   SetTemperature (`0x40`)
+-   push buttons (PushButtonState, `0x50`)
+
+Only messages addressed to `gateway_id` are answered. So `gateway_id` must be the address your devices are paired with (e.g. the address of your old Cube or FHEM CUL).
+
+The CUL also reports every Ack it sends. These lines come from the gateway address and are ignored by the bridge (log level `debug` shows "Ignored own auto-Ack").
+
+Requires culfw 1.52 or newer (FHEM uses the same limit). All current culfw and a-culfw versions support it.
+
 ## Duty Cycle and Buffer Management
 
 The bridge adheres to 868MHz 1% transmission limits using CUL's credit system.
@@ -116,6 +132,8 @@ This bridge implements the following filter of message types.
     -   **Reason**: Contain insufficient data to be useful.
 -   **Shutter Contacts (`0x30`)**:
     -   **Reason**: Out of scope for this climate-focused bridge.
+-   **Own auto-Acks (`0x02` from `gateway_id`)**:
+    -   **Reason**: Sent by the CUL itself (see Auto-Ack above), not by a device.
 
 ## Device Configuration
 
